@@ -1,248 +1,291 @@
 """
-NER stage orchestration
-=======================
-Reads a PAGE-XML file produced by the layout + transcription stages,
-extracts the plain text from each TextRegion, runs Gemini-based NER
-on the combined page text, and writes a new PAGE-XML file that adds
-a <NamedEntities> block under the <Page> element:
+============================================================
+HistOrniGraph — NER Stage Runner (Step 3, Colab)
+============================================================
+Runs Named Entity Recognition on every PAGE-XML page produced by the
+layout + transcription stages and writes annotated copies under
+``pagexml_ner/`` next to the original ``pagexml/`` folder.
 
-    <Page ...>
-        ...
-        <TextRegion id="r02">...</TextRegion>
-        ...
-        <NamedEntities>
-            <NamedEntity regionRef="r02" type="Location" text="München"
-                         context="Im englischen Garten ..."/>
-            ...
-        </NamedEntities>
-    </Page>
+Usage in Colab
+--------------
+1. Mount Google Drive
+2. Set GEMINI_API_KEY (e.g. via google.colab.userdata.get('GEMINI_API_KEY')
+   or os.environ — the google-genai client picks it up automatically).
+3. Pick what to process. Either:
+     a) Set the environment variables before %run::
 
-Original PAGE-XML files in ``output/pagexml`` are NOT modified — annotated
-copies are written to ``output/pagexml_ner``.  The Create_GUIs.py viewer
-prefers ``pagexml_ner`` if it exists and falls back to ``pagexml`` otherwise.
+          import os
+          os.environ['BOOK_ROOT_DIR'] = '/content/drive/.../Laubmann_01_gemini'
+          %run Run_NER_Stage.py
+
+        (works with plain ``%run`` — fresh namespace, env vars survive),
+
+     or
+     b) Use ``%run -i`` so the notebook globals are visible to the script::
+
+          BOOK_ROOT_DIR_OVERRIDE = '/content/drive/.../Laubmann_01_gemini'
+          %run -i Run_NER_Stage.py
+
+4. Run.
+
+Output structure
+----------------
+For every book folder ``<root>/<book>/pagexml/*.xml`` the script writes
+``<root>/<book>/pagexml_ner/*.xml``.  The annotated XML files are
+identical to the originals plus inline ``namedentity {offset; length;
+type;}`` tags on each TextRegion's ``custom`` attribute (Transkribus
+convention) and a denormalised ``<NamedEntities>`` index block under
+``<Page>``.
+
+The original ``pagexml/`` folder is never modified — re-runs are safe.
+By default already-annotated pages are skipped (set ``SKIP_EXISTING=False``
+to force re-processing).
+============================================================
 """
 
-from __future__ import annotations
-
-import json
-import logging
-import re
-import xml.dom.minidom as minidom
-from datetime import datetime, timezone
+import os
+import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from xml.etree import ElementTree as ET
-
-from .ner import Entity, perform_ner
-
-log = logging.getLogger(__name__)
-
-PAGE_NS = "http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"
-
-# Strip transcription markup like <u>...</u> / <sup>...</sup> before sending to NER.
-_MARKUP_RE = re.compile(r"</?(?:u|sup|sub|s|del|ins|mark|b|i|em|strong|small)\b[^>]*>",
-                        flags=re.IGNORECASE)
-# Soft-hyphen at end of line: "Zaunköni-\nge" → "Zaunkönige"
-_LINE_HYPHEN_RE = re.compile(r"-\n")
-_WS_RE = re.compile(r"[ \t]+\n")
 
 
-def _strip_markup(text: str) -> str:
-    """Remove HTML-like markup tags and join soft-hyphenated words."""
-    if not text:
-        return ""
-    cleaned = _MARKUP_RE.sub("", text)
-    cleaned = _LINE_HYPHEN_RE.sub("", cleaned)
-    cleaned = _WS_RE.sub("\n", cleaned)
-    return cleaned
+# ═══════════════════════════════════════════════════════════
+# CONFIGURATION RESOLUTION
+# ═══════════════════════════════════════════════════════════
+#
+# Priority order for every override below:
+#   1. os.environ[NAME]                         — survives plain `%run`
+#   2. IPython user namespace                   — works with `%run -i`
+#   3. globals()                                — same script's own globals
+#   4. fallback default
+#
+# Plain ``%run script.py`` executes the script in a *fresh* namespace,
+# so ``globals()`` here does NOT see notebook variables.  ``%run -i``
+# does share globals.  The IPython lookup below works in both cases when
+# variables are set in the notebook.
 
-
-def _local(tag: str) -> str:
-    """Strip XML namespace from a tag."""
-    return tag.split("}", 1)[1] if "}" in tag else tag
-
-
-def _read_pagexml(xml_path: Path) -> Tuple[ET.ElementTree, ET.Element, List[Dict[str, str]]]:
-    """Parse a PAGE XML file and return (tree, page_element, regions).
-
-    ``regions`` is a list of {id, type, text} for every TextRegion that
-    has transcribed Unicode content.  Markup tags are preserved here —
-    callers strip them with ``_strip_markup`` before sending to NER.
-    """
-    # Register the PAGE namespace so that ET writes default-namespaced output
-    ET.register_namespace("", PAGE_NS)
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-
-    page = None
-    for child in root.iter():
-        if _local(child.tag) == "Page":
-            page = child
-            break
-    if page is None:
-        raise ValueError(f"No <Page> element found in {xml_path}")
-
-    regions: List[Dict[str, str]] = []
-    for child in page:
-        if _local(child.tag) != "TextRegion":
-            continue
-        rid = child.get("id", "")
-        custom = child.get("custom", "")
-        # Try to parse "type:Foo" out of the custom attribute
-        rtype = ""
-        m = re.search(r"type:([A-Za-z]+)", custom)
-        if m:
-            rtype = m.group(1)
-
-        # Find Unicode text under TextEquiv
-        text = ""
-        for sub in child.iter():
-            if _local(sub.tag) == "Unicode" and sub.text:
-                text = sub.text
-                break
-
-        if text:
-            regions.append({"id": rid, "type": rtype, "text": text})
-
-    return tree, page, regions
-
-
-def _build_page_text(regions: List[Dict[str, str]],
-                     skip_types: Optional[set] = None) -> Tuple[str, List[Tuple[str, str]]]:
-    """Concatenate region texts (markup-stripped) into one page-level string.
-
-    Returns ``(combined_text, [(region_id, clean_text), ...])`` so that
-    callers can later attribute each entity hit back to a region.
-    """
-    skip_types = skip_types or {"PageNumberRegion", "ImageRegion", "ObjectRegion"}
-    parts: List[Tuple[str, str]] = []
-    pieces: List[str] = []
-    for r in regions:
-        if r["type"] in skip_types:
-            continue
-        clean = _strip_markup(r["text"])
-        if not clean.strip():
-            continue
-        parts.append((r["id"], clean))
-        pieces.append(clean)
-    return "\n\n".join(pieces), parts
-
-
-def _attribute_to_regions(entities: List[Entity],
-                          region_texts: List[Tuple[str, str]]) -> None:
-    """Best-effort: set ``Entity.region_ref`` to the first region containing the text."""
-    for ent in entities:
-        if not ent.text:
-            continue
-        for rid, rtext in region_texts:
-            if ent.text in rtext:
-                ent.region_ref = rid
-                break
-
-
-def _add_named_entities_element(page: ET.Element,
-                                entities: List[Entity]) -> ET.Element:
-    """Replace any existing <NamedEntities> block under ``page`` with a fresh one."""
-    # Remove old block if present (idempotent re-runs)
-    for existing in list(page):
-        if _local(existing.tag) == "NamedEntities":
-            page.remove(existing)
-
-    ns = f"{{{PAGE_NS}}}"
-    block = ET.SubElement(page, f"{ns}NamedEntities")
-    for ent in entities:
-        attrs = {
-            "type": ent.entity_type,
-            "text": ent.text,
-        }
-        if ent.region_ref:
-            attrs["regionRef"] = ent.region_ref
-        if ent.context:
-            attrs["context"] = ent.context
-        ET.SubElement(block, f"{ns}NamedEntity", attrs)
-    return block
-
-
-def _write_pretty(tree: ET.ElementTree, out_path: Path) -> None:
-    """Pretty-print and write the XML, matching the original generator style."""
-    xml_str = ET.tostring(tree.getroot(), encoding="unicode")
-    pretty = minidom.parseString(xml_str).toprettyxml(indent="  ", encoding=None)
-    # Drop the extra <?xml ...?> declaration minidom adds to match output_pagexml.py
-    pretty = "\n".join(line for line in pretty.splitlines()[1:] if line.strip())
-    out_path.write_text(pretty + "\n", encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def annotate_pagexml(
-    client: Any,
-    xml_path: Path,
-    out_path: Path,
-    entity_types: Dict[str, str],
-    model_id: str,
-    thinking_level: str = "low",
-    skip_existing: bool = True,
-) -> Dict[str, Any]:
-    """Run NER on one PAGE-XML file and write an annotated copy.
-
-    Returns a small summary dict with keys: ``page``, ``status``, ``n_entities``.
-    """
-    page_id = xml_path.stem
-
-    if skip_existing and out_path.exists():
-        return {"page": page_id, "status": "skipped", "n_entities": -1}
-
+def _resolve(name: str, default):
+    """Return the first value found in env / IPython / globals, else default."""
+    val = os.environ.get(name)
+    if val:
+        return val
     try:
-        tree, page_el, regions = _read_pagexml(xml_path)
-    except Exception as exc:
-        log.error("Failed to parse %s: %s", xml_path, exc)
-        return {"page": page_id, "status": "parse_error", "n_entities": 0}
-
-    combined, region_texts = _build_page_text(regions)
-    if not combined.strip():
-        # No transcribed text — still write an empty annotated copy so the
-        # GUI can find the file alongside the original pagexml.
-        _add_named_entities_element(page_el, [])
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_pretty(tree, out_path)
-        return {"page": page_id, "status": "empty", "n_entities": 0}
-
-    entities = perform_ner(
-        client=client,
-        text=combined,
-        entity_types=entity_types,
-        model_id=model_id,
-        thinking_level=thinking_level,
-        page_id=page_id,
-    )
-    _attribute_to_regions(entities, region_texts)
-
-    _add_named_entities_element(page_el, entities)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_pretty(tree, out_path)
-
-    return {"page": page_id, "status": "ok", "n_entities": len(entities)}
+        from IPython import get_ipython  # type: ignore
+        ip = get_ipython()
+        if ip is not None and name in ip.user_ns:
+            v = ip.user_ns.get(name)
+            if v not in (None, ""):
+                return v
+    except Exception:
+        pass
+    if name in globals():
+        v = globals().get(name)
+        if v not in (None, ""):
+            return v
+    return default
 
 
-def parse_named_entities(xml_path: Path) -> List[Dict[str, Any]]:
-    """Read back the <NamedEntity> entries from an annotated PAGE-XML file.
+# Process EITHER one book (BOOK_ROOT_DIR) OR every book under BOOKS_ROOT_DIR.
+BOOK_ROOT_DIR  = _resolve("BOOK_ROOT_DIR_OVERRIDE",  "") or _resolve("BOOK_ROOT_DIR", "")
+BOOKS_ROOT_DIR = _resolve("BOOKS_ROOT_DIR_OVERRIDE", "") or _resolve(
+    "BOOKS_ROOT_DIR", "/content/drive/MyDrive/HistOrniGraph_output"
+)
 
-    Used by tools that consume NER output (e.g. evaluation scripts).
+# Gemini model and thinking level
+NER_MODEL_ID       = _resolve("NER_MODEL_ID_OVERRIDE",       "") or _resolve(
+    "NER_MODEL_ID", "gemini-3-flash-preview"
+)
+NER_THINKING_LEVEL = _resolve("NER_THINKING_LEVEL_OVERRIDE", "") or _resolve(
+    "NER_THINKING_LEVEL", "low"
+)
+
+# Skip pages whose annotated XML already exists in pagexml_ner/
+_skip_raw = _resolve("SKIP_EXISTING_OVERRIDE", None)
+if _skip_raw is None:
+    _skip_raw = _resolve("SKIP_EXISTING", True)
+SKIP_EXISTING = _skip_raw if isinstance(_skip_raw, bool) else \
+    str(_skip_raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+# Subdirectory names — change only if your output layout differs
+PAGEXML_SUBDIR     = "pagexml"
+PAGEXML_NER_SUBDIR = "pagexml_ner"
+
+
+# ═══════════════════════════════════════════════════════════
+# CLIENT INITIALISATION
+# ═══════════════════════════════════════════════════════════
+
+def _init_client():
+    """Create an authenticated google-genai client.
+
+    Picks up the API key from (in order):
+      1. ``google.colab.userdata.get('GEMINI_API_KEY')``
+      2. ``os.environ['GEMINI_API_KEY']``
+      3. ``os.environ['GOOGLE_API_KEY']``
     """
-    if not xml_path.exists():
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise SystemExit(
+            "google-genai is not installed. Run:\n"
+            "    !pip install -q google-genai"
+        ) from exc
+
+    if "GEMINI_API_KEY" not in os.environ and "GOOGLE_API_KEY" not in os.environ:
+        try:
+            from google.colab import userdata  # type: ignore
+            key = userdata.get("GEMINI_API_KEY")
+            if key:
+                os.environ["GEMINI_API_KEY"] = key
+        except Exception:
+            pass
+
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        raise SystemExit(
+            "No API key found. Set GEMINI_API_KEY in Colab "
+            "(Tools → User secrets) or os.environ before running."
+        )
+
+    return genai.Client(http_options={"api_version": "v1alpha"})
+
+
+# ═══════════════════════════════════════════════════════════
+# BOOK / PAGE DISCOVERY
+# ═══════════════════════════════════════════════════════════
+
+def _list_books(books_root: Path) -> list:
+    """Return every immediate sub-folder of ``books_root`` that has a pagexml/ dir."""
+    if not books_root.is_dir():
         return []
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    out: List[Dict[str, Any]] = []
-    for el in root.iter():
-        if _local(el.tag) != "NamedEntity":
-            continue
-        out.append({
-            "text": el.get("text", ""),
-            "entity_type": el.get("type", ""),
-            "region_ref": el.get("regionRef") or None,
-            "context": el.get("context") or None,
-        })
+    out = []
+    for sub in sorted(books_root.iterdir()):
+        if sub.is_dir() and (sub / PAGEXML_SUBDIR).is_dir():
+            out.append(sub)
     return out
+
+
+def _list_pages(book_dir: Path) -> list:
+    """Return every page XML file under ``book_dir/pagexml``, naturally sorted."""
+    src = book_dir / PAGEXML_SUBDIR
+    if not src.is_dir():
+        return []
+    files = [p for p in src.iterdir() if p.suffix.lower() == ".xml"]
+
+    def _key(p: Path):
+        import re
+        return [int(c) if c.isdigit() else c.lower()
+                for c in re.split(r"(\d+)", p.stem)]
+
+    return sorted(files, key=_key)
+
+
+# ═══════════════════════════════════════════════════════════
+# CORE LOOP
+# ═══════════════════════════════════════════════════════════
+
+def process_book(client, book_dir: Path) -> dict:
+    """Run NER on every page of one book."""
+    # Ensure the journal_processor package is importable when this file is
+    # placed next to the ``journal_processor/`` folder (typical Colab layout).
+    here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+
+    from journal_processor.config import ENTITY_TYPES
+    from journal_processor.ner_stage import annotate_pagexml
+
+    src_dir = book_dir / PAGEXML_SUBDIR
+    out_dir = book_dir / PAGEXML_NER_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pages = _list_pages(book_dir)
+    print(f"\n📚 {book_dir.name}: {len(pages)} page(s)")
+    if not pages:
+        return {"book": book_dir.name, "pages": 0, "ok": 0, "skipped": 0,
+                "errors": 0, "total_entities": 0}
+
+    ok = skipped = errors = total_ents = 0
+    t0 = time.time()
+
+    for idx, page_xml in enumerate(pages, 1):
+        out_xml = out_dir / page_xml.name
+        try:
+            res = annotate_pagexml(
+                client=client,
+                xml_path=page_xml,
+                out_path=out_xml,
+                entity_types=ENTITY_TYPES,
+                model_id=NER_MODEL_ID,
+                thinking_level=NER_THINKING_LEVEL,
+                skip_existing=SKIP_EXISTING,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            print(f"   [{idx}/{len(pages)}] ✗ {page_xml.stem}: {exc}")
+            continue
+
+        if res["status"] == "skipped":
+            skipped += 1
+        elif res["status"] in ("ok", "empty"):
+            ok += 1
+            total_ents += max(0, res["n_entities"])
+            print(f"   [{idx}/{len(pages)}] ✓ {res['page']}: "
+                  f"{res['n_entities']} entit{'y' if res['n_entities'] == 1 else 'ies'}")
+        else:
+            errors += 1
+            print(f"   [{idx}/{len(pages)}] ✗ {res['page']}: {res['status']}")
+
+    elapsed = time.time() - t0
+    print(f"   → done in {elapsed:.1f}s   "
+          f"ok={ok}  skipped={skipped}  errors={errors}  entities={total_ents}")
+    return {"book": book_dir.name, "pages": len(pages),
+            "ok": ok, "skipped": skipped, "errors": errors,
+            "total_entities": total_ents, "elapsed_s": round(elapsed, 1)}
+
+
+def main() -> None:
+    print("🔬 HistOrniGraph — NER Stage Runner")
+    print(f"   Model:    {NER_MODEL_ID}")
+    print(f"   Thinking: {NER_THINKING_LEVEL}")
+    print(f"   Skip existing: {SKIP_EXISTING}")
+    print()
+
+    client = _init_client()
+
+    # Resolve target book(s)
+    if BOOK_ROOT_DIR:
+        single = Path(BOOK_ROOT_DIR.rstrip("/"))
+        if not single.is_dir():
+            raise SystemExit(f"❌ BOOK_ROOT_DIR not found: {single}")
+        books = [single]
+        print(f"   Target: single book → {single}")
+    else:
+        root = Path(BOOKS_ROOT_DIR.rstrip("/"))
+        if not root.is_dir():
+            raise SystemExit(f"❌ BOOKS_ROOT_DIR not found: {root}")
+        books = _list_books(root)
+        print(f"   Target: {len(books)} book(s) under {root}")
+        if not books:
+            print("   ⚠ No book folders with a pagexml/ subdirectory found.")
+            return
+
+    summary = []
+    for b in books:
+        summary.append(process_book(client, b))
+
+    # Final summary
+    print("\n📊 Summary")
+    print(f"   {'Book':<32}  {'Pages':>6}  {'OK':>4}  {'Skip':>4}  "
+          f"{'Err':>4}  {'Entities':>8}")
+    for s in summary:
+        print(f"   {s['book']:<32}  {s['pages']:>6}  {s['ok']:>4}  "
+              f"{s['skipped']:>4}  {s['errors']:>4}  {s['total_entities']:>8}")
+
+    grand_total = sum(s["total_entities"] for s in summary)
+    print(f"\n   ✅ Total entities: {grand_total}")
+    print(f"   Output: <book>/{PAGEXML_NER_SUBDIR}/*.xml")
+    print(f"\n   Next: re-run Create_GUIs.py for each book to view entities in the GUI.")
+
+
+if __name__ == "__main__":
+    main()

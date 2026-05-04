@@ -326,7 +326,9 @@ def parse_pagexml(xml_path):
     page_height = int(page_el.get('imageHeight', 0)) if page_el is not None else 0
 
     regions = []
-    entities = []
+    raw_entity_elements = []  # collected first, resolved against region texts below
+    region_text_by_id = {}    # region id → <Unicode> text content
+
     if page_el is not None:
         for region in page_el:
             tag_name = region.tag.split('}')[-1] if '}' in region.tag else region.tag
@@ -337,17 +339,24 @@ def parse_pagexml(xml_path):
                     ent_tag = ent.tag.split('}')[-1] if '}' in ent.tag else ent.tag
                     if ent_tag != 'NamedEntity':
                         continue
-                    entities.append({
-                        "text": ent.get("text", ""),
-                        "type": ent.get("type", ""),
-                        "regionRef": ent.get("regionRef", ""),
-                        "context": ent.get("context", ""),
-                    })
+                    raw_entity_elements.append(ent)
                 continue
 
             region_id = region.get('id', '')
             region_type = region.get('type', tag_name)
             custom = region.get('custom', '')
+
+            # Capture the region's transcription so we can slice entities
+            # from it later (the canonical text source for offset/length).
+            for child in region:
+                child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                if child_tag == 'TextEquiv':
+                    for sub in child:
+                        sub_tag = sub.tag.split('}')[-1] if '}' in sub.tag else sub.tag
+                        if sub_tag == 'Unicode' and sub.text:
+                            region_text_by_id[region_id] = sub.text
+                            break
+                    break
 
             coords_el = None
             for child in region:
@@ -371,6 +380,39 @@ def parse_pagexml(xml_path):
                             "custom": custom,
                             "points": points,
                         })
+
+    # ── Resolve entity text from region <Unicode> using offset+length ────
+    #
+    # Storing offset+length on <NamedEntity> and slicing at read time is
+    # the format used by ner_stage.py (Transkribus-style inline tags).
+    # Older files that still carry text="…" are handled by falling back
+    # to that attribute when offset/length are absent or invalid.
+    def _to_int(s):
+        try:
+            return int(s) if s not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    entities = []
+    for ent in raw_entity_elements:
+        rid    = ent.get("regionRef", "")
+        offset = _to_int(ent.get("offset"))
+        length = _to_int(ent.get("length"))
+        text   = ""
+        if rid and offset is not None and length is not None:
+            src = region_text_by_id.get(rid, "")
+            if 0 <= offset < len(src) and length > 0:
+                text = src[offset:offset + length]
+        if not text:
+            text = ent.get("text", "")  # legacy fallback
+        entities.append({
+            "text":      text,
+            "type":      ent.get("type", ""),
+            "regionRef": rid,
+            "offset":    offset if offset is not None else -1,
+            "length":    length if length is not None else -1,
+            "context":   ent.get("context", ""),
+        })
 
     return {
         "width": page_width,

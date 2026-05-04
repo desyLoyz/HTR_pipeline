@@ -1,291 +1,612 @@
 """
-============================================================
-HistOrniGraph — NER Stage Runner (Step 3, Colab)
-============================================================
-Runs Named Entity Recognition on every PAGE-XML page produced by the
-layout + transcription stages and writes annotated copies under
-``pagexml_ner/`` next to the original ``pagexml/`` folder.
+NER stage orchestration
+=======================
+Reads a PAGE-XML file produced by the layout + transcription stages, runs
+Gemini-based NER on each TextRegion's transcription, and writes a new
+PAGE-XML file in which:
 
-Usage in Colab
---------------
-1. Mount Google Drive
-2. Set GEMINI_API_KEY (e.g. via google.colab.userdata.get('GEMINI_API_KEY')
-   or os.environ — the google-genai client picks it up automatically).
-3. Pick what to process. Either:
-     a) Set the environment variables before %run::
+(1) Each detected entity is encoded **inline** on its TextRegion using the
+    Transkribus ``custom``-attribute convention (offset / length syntax),
+    e.g.::
 
-          import os
-          os.environ['BOOK_ROOT_DIR'] = '/content/drive/.../Laubmann_01_gemini'
-          %run Run_NER_Stage.py
+        <TextRegion id="r02"
+            custom="type:ParagraphRegion
+                    namedentity {offset:14; length:7; type:Location;}
+                    namedentity {offset:79; length:23; type:Animal;}">
 
-        (works with plain ``%run`` — fresh namespace, env vars survive),
+    This is the de-facto standard used by Transkribus, eScriptorium, OCR-D
+    and the page2tei converter for inline tagging — ``offset`` is the
+    character index into the region's <Unicode> string, ``length`` is the
+    number of characters covered by the entity.  Multiple entities can be
+    attached to one region, and a single entity that occurs more than once
+    in the same region produces one custom-attribute entry per occurrence.
 
-     or
-     b) Use ``%run -i`` so the notebook globals are visible to the script::
+(2) A denormalised ``<NamedEntities>`` block is also written under the
+    ``<Page>`` element, with one ``<NamedEntity>`` per occurrence carrying
+    ``regionRef``, ``offset``, ``length``, ``type``, ``text`` and an
+    optional ``context`` snippet.  This index is regenerated from the
+    inline tags on every run so the two representations cannot drift
+    apart.  The GUI consumes this index for fast lookup.  Tools that need
+    fine-grained token offsets (training-data extraction, evaluation,
+    Aletheia / Transkribus integrations) should read the inline ``custom``
+    attributes directly via ``parse_inline_custom_entities``.
 
-          BOOK_ROOT_DIR_OVERRIDE = '/content/drive/.../Laubmann_01_gemini'
-          %run -i Run_NER_Stage.py
-
-4. Run.
-
-Output structure
-----------------
-For every book folder ``<root>/<book>/pagexml/*.xml`` the script writes
-``<root>/<book>/pagexml_ner/*.xml``.  The annotated XML files are
-identical to the originals plus inline ``namedentity {offset; length;
-type;}`` tags on each TextRegion's ``custom`` attribute (Transkribus
-convention) and a denormalised ``<NamedEntities>`` index block under
-``<Page>``.
-
-The original ``pagexml/`` folder is never modified — re-runs are safe.
-By default already-annotated pages are skipped (set ``SKIP_EXISTING=False``
-to force re-processing).
-============================================================
+Original PAGE-XML files in ``output/pagexml`` are NOT modified — annotated
+copies are written to ``output/pagexml_ner``.  The Create_GUIs.py viewer
+prefers ``pagexml_ner`` if it exists and falls back to ``pagexml`` otherwise.
 """
 
-import os
-import sys
-import time
+from __future__ import annotations
+
+import logging
+import re
+import xml.dom.minidom as minidom
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree as ET
 
+from .ner import Entity, perform_ner
 
-# ═══════════════════════════════════════════════════════════
-# CONFIGURATION RESOLUTION
-# ═══════════════════════════════════════════════════════════
-#
-# Priority order for every override below:
-#   1. os.environ[NAME]                         — survives plain `%run`
-#   2. IPython user namespace                   — works with `%run -i`
-#   3. globals()                                — same script's own globals
-#   4. fallback default
-#
-# Plain ``%run script.py`` executes the script in a *fresh* namespace,
-# so ``globals()`` here does NOT see notebook variables.  ``%run -i``
-# does share globals.  The IPython lookup below works in both cases when
-# variables are set in the notebook.
+log = logging.getLogger(__name__)
 
-def _resolve(name: str, default):
-    """Return the first value found in env / IPython / globals, else default."""
-    val = os.environ.get(name)
-    if val:
-        return val
-    try:
-        from IPython import get_ipython  # type: ignore
-        ip = get_ipython()
-        if ip is not None and name in ip.user_ns:
-            v = ip.user_ns.get(name)
-            if v not in (None, ""):
-                return v
-    except Exception:
-        pass
-    if name in globals():
-        v = globals().get(name)
-        if v not in (None, ""):
-            return v
-    return default
+PAGE_NS = "http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"
 
-
-# Process EITHER one book (BOOK_ROOT_DIR) OR every book under BOOKS_ROOT_DIR.
-BOOK_ROOT_DIR  = _resolve("BOOK_ROOT_DIR_OVERRIDE",  "") or _resolve("BOOK_ROOT_DIR", "")
-BOOKS_ROOT_DIR = _resolve("BOOKS_ROOT_DIR_OVERRIDE", "") or _resolve(
-    "BOOKS_ROOT_DIR", "/content/drive/MyDrive/HistOrniGraph_output"
+# Markup we strip before sending text to the NER prompt — these tags are
+# stored *literally* (escaped) inside <Unicode>, so leaving them in place
+# would only confuse the model.  Offsets are computed against the RAW
+# <Unicode> string so they round-trip cleanly.
+_MARKUP_TAG_RE = re.compile(
+    r"</?(?:u|sup|sub|s|del|ins|mark|b|i|em|strong|small)\b[^>]*>",
+    flags=re.IGNORECASE,
 )
 
-# Gemini model and thinking level
-NER_MODEL_ID       = _resolve("NER_MODEL_ID_OVERRIDE",       "") or _resolve(
-    "NER_MODEL_ID", "gemini-3-flash-preview"
-)
-NER_THINKING_LEVEL = _resolve("NER_THINKING_LEVEL_OVERRIDE", "") or _resolve(
-    "NER_THINKING_LEVEL", "low"
-)
+# Tag name used in the inline ``custom`` attribute.  Lowercase keeps it in
+# line with Transkribus's convention (``person``, ``place``, etc.) while a
+# single generic tag avoids forcing downstream tools to know our 11-class
+# scheme — the actual class lives in the ``type`` body field.
+INLINE_TAG_NAME = "namedentity"
 
-# Skip pages whose annotated XML already exists in pagexml_ner/
-_skip_raw = _resolve("SKIP_EXISTING_OVERRIDE", None)
-if _skip_raw is None:
-    _skip_raw = _resolve("SKIP_EXISTING", True)
-SKIP_EXISTING = _skip_raw if isinstance(_skip_raw, bool) else \
-    str(_skip_raw).strip().lower() not in {"0", "false", "no", "off", ""}
-
-# Subdirectory names — change only if your output layout differs
-PAGEXML_SUBDIR     = "pagexml"
-PAGEXML_NER_SUBDIR = "pagexml_ner"
+# Region types whose transcribed text is uninteresting for NER.
+_NER_SKIP_TYPES = frozenset({"PageNumberRegion", "ImageRegion", "ObjectRegion"})
 
 
-# ═══════════════════════════════════════════════════════════
-# CLIENT INITIALISATION
-# ═══════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Markup stripping with offset map
+# ---------------------------------------------------------------------------
 
-def _init_client():
-    """Create an authenticated google-genai client.
+def _strip_with_map(raw: str) -> Tuple[str, List[int]]:
+    """Strip <u>/<sup>/… and join soft hyphens; return (clean, raw_idx_of_clean).
 
-    Picks up the API key from (in order):
-      1. ``google.colab.userdata.get('GEMINI_API_KEY')``
-      2. ``os.environ['GEMINI_API_KEY']``
-      3. ``os.environ['GOOGLE_API_KEY']``
+    ``raw_idx_of_clean[i]`` gives the offset in ``raw`` that produced
+    ``clean[i]``.  The map lets callers project a (start, end) span found
+    in the cleaned text back onto raw-text offsets, so the canonical raw
+    <Unicode> string remains the single source of truth for the inline
+    ``custom`` tags.
     """
-    try:
-        from google import genai
-    except ImportError as exc:
-        raise SystemExit(
-            "google-genai is not installed. Run:\n"
-            "    !pip install -q google-genai"
-        ) from exc
+    clean_chars: List[str] = []
+    raw_idx: List[int] = []
 
-    if "GEMINI_API_KEY" not in os.environ and "GOOGLE_API_KEY" not in os.environ:
-        try:
-            from google.colab import userdata  # type: ignore
-            key = userdata.get("GEMINI_API_KEY")
-            if key:
-                os.environ["GEMINI_API_KEY"] = key
-        except Exception:
-            pass
+    i = 0
+    n = len(raw)
+    while i < n:
+        # 1. Skip a markup tag like "<u>" or "</sup>"
+        m = _MARKUP_TAG_RE.match(raw, i)
+        if m:
+            i = m.end()
+            continue
+        # 2. Soft hyphen at line break: "-\n" disappears
+        if raw[i] == "-" and i + 1 < n and raw[i + 1] == "\n":
+            i += 2
+            continue
+        # 3. Regular character — keep it
+        clean_chars.append(raw[i])
+        raw_idx.append(i)
+        i += 1
 
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        raise SystemExit(
-            "No API key found. Set GEMINI_API_KEY in Colab "
-            "(Tools → User secrets) or os.environ before running."
-        )
-
-    return genai.Client(http_options={"api_version": "v1alpha"})
+    return "".join(clean_chars), raw_idx
 
 
-# ═══════════════════════════════════════════════════════════
-# BOOK / PAGE DISCOVERY
-# ═══════════════════════════════════════════════════════════
+def _project_to_raw(span_in_clean: Tuple[int, int],
+                    raw_idx_of_clean: List[int],
+                    raw_len: int) -> Tuple[int, int]:
+    """Project a half-open ``[start, end)`` interval over the cleaned text
+    back to a half-open interval over the raw text that *covers* the same
+    span (extending across any intervening markup tags).
+    """
+    s_clean, e_clean = span_in_clean
+    n_clean = len(raw_idx_of_clean)
+    if s_clean >= e_clean or n_clean == 0:
+        return (raw_len, raw_len)
 
-def _list_books(books_root: Path) -> list:
-    """Return every immediate sub-folder of ``books_root`` that has a pagexml/ dir."""
-    if not books_root.is_dir():
+    raw_start = raw_idx_of_clean[s_clean]
+    raw_last = raw_idx_of_clean[min(e_clean - 1, n_clean - 1)]
+    return (raw_start, raw_last + 1)
+
+
+# ---------------------------------------------------------------------------
+# Custom-attribute syntax (Transkribus convention)
+# ---------------------------------------------------------------------------
+#
+#   tagName {key1:val1; key2:val2;}
+#
+# multiple tags space-separated on one attribute:
+#
+#   readingOrder {index:0;} namedentity {offset:14; length:7; type:Location;}
+
+_TAG_RE = re.compile(
+    r"(?P<name>[A-Za-z_][\w\-]*)\s*\{(?P<body>[^}]*)\}",
+    flags=re.UNICODE,
+)
+
+
+def _parse_custom(attr: str) -> List[Tuple[str, Dict[str, str]]]:
+    """Parse a Transkribus-style custom attribute into ``[(tag, {k:v}), …]``.
+
+    Bareword tokens without a ``{...}`` block (such as the legacy
+    ``type:ParagraphRegion`` form already present in this codebase) are
+    preserved as a single ``("type:ParagraphRegion", {})`` entry so they
+    round-trip through serialisation untouched.
+    """
+    if not attr:
         return []
-    out = []
-    for sub in sorted(books_root.iterdir()):
-        if sub.is_dir() and (sub / PAGEXML_SUBDIR).is_dir():
-            out.append(sub)
+    out: List[Tuple[str, Dict[str, str]]] = []
+    pos = 0
+    for m in _TAG_RE.finditer(attr):
+        gap = attr[pos:m.start()].strip()
+        if gap:
+            for token in gap.split():
+                out.append((token, {}))
+        body: Dict[str, str] = {}
+        for piece in m.group("body").split(";"):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if ":" in piece:
+                k, _, v = piece.partition(":")
+                body[k.strip()] = v.strip()
+            else:
+                body[piece] = ""
+        out.append((m.group("name"), body))
+        pos = m.end()
+    tail = attr[pos:].strip()
+    if tail:
+        for token in tail.split():
+            out.append((token, {}))
     return out
 
 
-def _list_pages(book_dir: Path) -> list:
-    """Return every page XML file under ``book_dir/pagexml``, naturally sorted."""
-    src = book_dir / PAGEXML_SUBDIR
-    if not src.is_dir():
+def _format_custom(parts: List[Tuple[str, Dict[str, str]]]) -> str:
+    """Serialise ``[(tag, {k:v}), …]`` back into a custom-attribute string."""
+    pieces: List[str] = []
+    for name, body in parts:
+        if not body:
+            pieces.append(name)
+            continue
+        kv = " ".join(f"{k}:{v};" for k, v in body.items())
+        pieces.append(f"{name} {{{kv}}}")
+    return " ".join(pieces)
+
+
+# ---------------------------------------------------------------------------
+# PAGE-XML I/O
+# ---------------------------------------------------------------------------
+
+def _local(tag: str) -> str:
+    """Strip the XML namespace from an ElementTree tag."""
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _read_pagexml(
+    xml_path: Path,
+) -> Tuple[ET.ElementTree, ET.Element, List[Dict[str, Any]]]:
+    """Parse a PAGE XML file and return ``(tree, page_element, regions)``.
+
+    ``regions`` is a list of ``{id, type, text, element}`` for every
+    TextRegion that has transcribed Unicode content.  ``element`` is the
+    live ET element so callers can mutate the ``custom`` attribute in
+    place.
+    """
+    ET.register_namespace("", PAGE_NS)
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    page = None
+    for child in root.iter():
+        if _local(child.tag) == "Page":
+            page = child
+            break
+    if page is None:
+        raise ValueError(f"No <Page> element found in {xml_path}")
+
+    regions: List[Dict[str, Any]] = []
+    for child in page:
+        if _local(child.tag) != "TextRegion":
+            continue
+        rid = child.get("id", "")
+        custom = child.get("custom", "")
+        rtype = ""
+        m = re.search(r"type:([A-Za-z]+)", custom)
+        if m:
+            rtype = m.group(1)
+
+        text = ""
+        for sub in child.iter():
+            if _local(sub.tag) == "Unicode" and sub.text:
+                text = sub.text
+                break
+
+        if text:
+            regions.append({
+                "id": rid,
+                "type": rtype,
+                "text": text,
+                "element": child,
+            })
+
+    return tree, page, regions
+
+
+def _write_pretty(tree: ET.ElementTree, out_path: Path) -> None:
+    """Pretty-print and write the XML, matching the original generator style.
+
+    Important: we only drop the leading ``<?xml ?>`` declaration that
+    minidom adds — we do NOT filter blank lines, because blank lines
+    inside the ``<Unicode>`` text content (paragraph breaks in the
+    transcription) are semantically significant and shifting them by even
+    one character invalidates every offset stored in the inline
+    ``custom`` attributes.
+    """
+    xml_str = ET.tostring(tree.getroot(), encoding="unicode")
+    pretty = minidom.parseString(xml_str).toprettyxml(indent="  ", encoding=None)
+    pretty = "\n".join(pretty.splitlines()[1:])
+    out_path.write_text(pretty, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Entity → offset bookkeeping
+# ---------------------------------------------------------------------------
+
+# Word-character set (Unicode-aware) used to detect word boundaries.  We
+# treat anything that is NOT a unicode word character as a boundary so
+# that "Mai" inside "Maine" doesn't get matched as a separate entity.
+_WORD_RE = re.compile(r"\w", flags=re.UNICODE)
+
+
+def _find_all_offsets(haystack: str, needle: str,
+                      prefer_whole_word: bool = True) -> List[int]:
+    """Return every char-index where ``needle`` occurs inside ``haystack``.
+
+    If at least one whole-word match exists and ``prefer_whole_word`` is
+    set, only whole-word matches are returned.  Otherwise all substring
+    positions are returned (entity strings often contain spaces / dashes
+    so naive whole-word filtering would discard real hits).
+    """
+    if not needle:
         return []
-    files = [p for p in src.iterdir() if p.suffix.lower() == ".xml"]
+    positions: List[int] = []
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
 
-    def _key(p: Path):
-        import re
-        return [int(c) if c.isdigit() else c.lower()
-                for c in re.split(r"(\d+)", p.stem)]
+    if not prefer_whole_word or not positions:
+        return positions
 
-    return sorted(files, key=_key)
+    n = len(needle)
+    h_len = len(haystack)
+    whole: List[int] = []
+    for p in positions:
+        left_ok  = p == 0          or not _WORD_RE.match(haystack[p - 1])
+        right_ok = p + n == h_len  or not _WORD_RE.match(haystack[p + n])
+        if left_ok and right_ok:
+            whole.append(p)
+    return whole or positions
 
 
-# ═══════════════════════════════════════════════════════════
-# CORE LOOP
-# ═══════════════════════════════════════════════════════════
+def _occurrences_for_region(
+    raw_text: str,
+    clean_text: str,
+    raw_idx_of_clean: List[int],
+    entities: List[Entity],
+) -> List[Dict[str, Any]]:
+    """Locate every occurrence of every entity inside one region's raw text.
 
-def process_book(client, book_dir: Path) -> dict:
-    """Run NER on every page of one book."""
-    # Ensure the journal_processor package is importable when this file is
-    # placed next to the ``journal_processor/`` folder (typical Colab layout).
-    here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-    if str(here) not in sys.path:
-        sys.path.insert(0, str(here))
+    The model receives the cleaned text (no markup, hyphens joined) so we
+    search the cleaned form first and project the hit back to the raw
+    string used for inline offsets.  We then also try a literal raw match
+    to catch entities short enough to live entirely outside any markup
+    span — the union covers both.
 
-    from journal_processor.config import ENTITY_TYPES
-    from journal_processor.ner_stage import annotate_pagexml
+    Returns a list of dicts ``{offset, length, type, text, context}``
+    sorted by offset for deterministic output.
+    """
+    out: List[Dict[str, Any]] = []
+    raw_len = len(raw_text)
 
-    src_dir = book_dir / PAGEXML_SUBDIR
-    out_dir = book_dir / PAGEXML_NER_SUBDIR
-    out_dir.mkdir(parents=True, exist_ok=True)
+    for ent in entities:
+        seen_raw_starts: set = set()
 
-    pages = _list_pages(book_dir)
-    print(f"\n📚 {book_dir.name}: {len(pages)} page(s)")
-    if not pages:
-        return {"book": book_dir.name, "pages": 0, "ok": 0, "skipped": 0,
-                "errors": 0, "total_entities": 0}
-
-    ok = skipped = errors = total_ents = 0
-    t0 = time.time()
-
-    for idx, page_xml in enumerate(pages, 1):
-        out_xml = out_dir / page_xml.name
-        try:
-            res = annotate_pagexml(
-                client=client,
-                xml_path=page_xml,
-                out_path=out_xml,
-                entity_types=ENTITY_TYPES,
-                model_id=NER_MODEL_ID,
-                thinking_level=NER_THINKING_LEVEL,
-                skip_existing=SKIP_EXISTING,
+        # Primary: search in cleaned text, project back to raw.
+        for off_clean in _find_all_offsets(clean_text, ent.text):
+            raw_start, raw_end = _project_to_raw(
+                (off_clean, off_clean + len(ent.text)),
+                raw_idx_of_clean, raw_len,
             )
-        except Exception as exc:  # noqa: BLE001
-            errors += 1
-            print(f"   [{idx}/{len(pages)}] ✗ {page_xml.stem}: {exc}")
+            if raw_start in seen_raw_starts:
+                continue
+            seen_raw_starts.add(raw_start)
+            out.append({
+                "offset":  raw_start,
+                "length":  raw_end - raw_start,
+                "type":    ent.entity_type,
+                "text":    raw_text[raw_start:raw_end],
+                "context": ent.context,
+            })
+
+        # Fallback: literal raw match (covers entities matching raw verbatim).
+        for off_raw in _find_all_offsets(raw_text, ent.text):
+            if off_raw in seen_raw_starts:
+                continue
+            seen_raw_starts.add(off_raw)
+            out.append({
+                "offset":  off_raw,
+                "length":  len(ent.text),
+                "type":    ent.entity_type,
+                "text":    ent.text,
+                "context": ent.context,
+            })
+
+    out.sort(key=lambda r: (r["offset"], r["length"]))
+    return out
+
+
+def _attach_inline_tags(
+    region_el: ET.Element,
+    occurrences: List[Dict[str, Any]],
+) -> None:
+    """Replace existing ``namedentity`` tags on ``region_el`` with fresh ones."""
+    parts = _parse_custom(region_el.get("custom", ""))
+    parts = [(n, b) for n, b in parts if n != INLINE_TAG_NAME]
+
+    for occ in occurrences:
+        body = {
+            "offset": str(occ["offset"]),
+            "length": str(occ["length"]),
+            "type":   occ["type"],
+        }
+        parts.append((INLINE_TAG_NAME, body))
+
+    serialised = _format_custom(parts)
+    if serialised:
+        region_el.set("custom", serialised)
+    elif "custom" in region_el.attrib:
+        del region_el.attrib["custom"]
+
+
+def _add_named_entities_index(
+    page: ET.Element,
+    flat: List[Dict[str, Any]],
+) -> ET.Element:
+    """(Re)build the ``<NamedEntities>`` index block under ``<Page>``.
+
+    Each occurrence is one ``<NamedEntity>`` element with ``regionRef``,
+    ``offset``, ``length``, ``type`` and an optional ``context`` snippet.
+    The block is purely a denormalised index of the inline tags — the
+    canonical entity text is sliced from the region's ``<Unicode>`` at
+    read time (we deliberately do NOT store ``text=`` here because XML
+    attribute-value whitespace normalisation collapses any newline
+    inside the entity to a space, which would corrupt entities that
+    cross a soft-hyphen line break).
+    """
+    for existing in list(page):
+        if _local(existing.tag) == "NamedEntities":
+            page.remove(existing)
+
+    ns = f"{{{PAGE_NS}}}"
+    block = ET.SubElement(page, f"{ns}NamedEntities")
+    for rec in flat:
+        attrs = {
+            "regionRef": rec["regionRef"],
+            "offset":    str(rec["offset"]),
+            "length":    str(rec["length"]),
+            "type":      rec["type"],
+        }
+        if rec.get("context"):
+            attrs["context"] = rec["context"]
+        ET.SubElement(block, f"{ns}NamedEntity", attrs)
+    return block
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def annotate_pagexml(
+    client: Any,
+    xml_path: Path,
+    out_path: Path,
+    entity_types: Dict[str, str],
+    model_id: str,
+    thinking_level: str = "low",
+    skip_existing: bool = True,
+) -> Dict[str, Any]:
+    """Run NER on one PAGE-XML file and write an annotated copy.
+
+    Returns a small summary dict with keys ``page``, ``status``,
+    ``n_entities``.  ``n_entities`` counts *occurrences* (the size of the
+    index block), not distinct (text, type) pairs.
+    """
+    page_id = xml_path.stem
+
+    if skip_existing and out_path.exists():
+        return {"page": page_id, "status": "skipped", "n_entities": -1}
+
+    try:
+        tree, page_el, regions = _read_pagexml(xml_path)
+    except Exception as exc:
+        log.error("Failed to parse %s: %s", xml_path, exc)
+        return {"page": page_id, "status": "parse_error", "n_entities": 0}
+
+    region_views: List[Dict[str, Any]] = []
+    prompt_pieces: List[str] = []
+    for r in regions:
+        if r["type"] in _NER_SKIP_TYPES:
+            continue
+        clean, idx_map = _strip_with_map(r["text"])
+        if not clean.strip():
+            continue
+        prompt_pieces.append(clean)
+        region_views.append({**r, "clean": clean, "idx_map": idx_map})
+
+    combined = "\n\n".join(prompt_pieces)
+
+    if not combined.strip():
+        _add_named_entities_index(page_el, [])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_pretty(tree, out_path)
+        return {"page": page_id, "status": "empty", "n_entities": 0}
+
+    entities = perform_ner(
+        client=client,
+        text=combined,
+        entity_types=entity_types,
+        model_id=model_id,
+        thinking_level=thinking_level,
+        page_id=page_id,
+    )
+
+    flat_index: List[Dict[str, Any]] = []
+    for view in region_views:
+        occs = _occurrences_for_region(
+            view["text"], view["clean"], view["idx_map"], entities,
+        )
+        _attach_inline_tags(view["element"], occs)
+        for occ in occs:
+            flat_index.append({
+                "regionRef": view["id"],
+                "offset":    occ["offset"],
+                "length":    occ["length"],
+                "type":      occ["type"],
+                "text":      occ["text"],
+                "context":   occ["context"],
+            })
+
+    # Wipe stale namedentity tags from regions excluded from NER
+    skipped_ids = {r["id"] for r in regions if r["type"] in _NER_SKIP_TYPES}
+    for r in regions:
+        if r["id"] in skipped_ids:
+            _attach_inline_tags(r["element"], [])
+
+    _add_named_entities_index(page_el, flat_index)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_pretty(tree, out_path)
+
+    return {"page": page_id, "status": "ok", "n_entities": len(flat_index)}
+
+
+def parse_named_entities(xml_path: Path) -> List[Dict[str, Any]]:
+    """Read NamedEntity records from the ``<NamedEntities>`` index block.
+
+    The entity text is sliced from the referenced TextRegion's
+    ``<Unicode>`` content at ``[offset, offset+length)`` rather than read
+    from a stored attribute, because XML attribute normalisation collapses
+    embedded newlines to spaces and would corrupt entities crossing a
+    soft-hyphen line break.
+
+    Returns ``[{text, entity_type, region_ref, offset, length, context}, …]``.
+    """
+    if not xml_path.exists():
+        return []
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    # Build a region_id → Unicode-text map first
+    region_text: Dict[str, str] = {}
+    for tr in root.iter():
+        if _local(tr.tag) != "TextRegion":
+            continue
+        rid = tr.get("id", "")
+        for sub in tr.iter():
+            if _local(sub.tag) == "Unicode" and sub.text:
+                region_text[rid] = sub.text
+                break
+
+    out: List[Dict[str, Any]] = []
+    for el in root.iter():
+        if _local(el.tag) != "NamedEntity":
             continue
 
-        if res["status"] == "skipped":
-            skipped += 1
-        elif res["status"] in ("ok", "empty"):
-            ok += 1
-            total_ents += max(0, res["n_entities"])
-            print(f"   [{idx}/{len(pages)}] ✓ {res['page']}: "
-                  f"{res['n_entities']} entit{'y' if res['n_entities'] == 1 else 'ies'}")
+        def _to_int(s: Optional[str]) -> Optional[int]:
+            try:
+                return int(s) if s is not None and s != "" else None
+            except (TypeError, ValueError):
+                return None
+
+        rid    = el.get("regionRef") or ""
+        offset = _to_int(el.get("offset"))
+        length = _to_int(el.get("length"))
+
+        if rid and offset is not None and length is not None:
+            src = region_text.get(rid, "")
+            text = src[offset:offset + length] if 0 <= offset < len(src) else ""
         else:
-            errors += 1
-            print(f"   [{idx}/{len(pages)}] ✗ {res['page']}: {res['status']}")
+            # Legacy files might still carry text="…" — fall back to it
+            text = el.get("text", "")
 
-    elapsed = time.time() - t0
-    print(f"   → done in {elapsed:.1f}s   "
-          f"ok={ok}  skipped={skipped}  errors={errors}  entities={total_ents}")
-    return {"book": book_dir.name, "pages": len(pages),
-            "ok": ok, "skipped": skipped, "errors": errors,
-            "total_entities": total_ents, "elapsed_s": round(elapsed, 1)}
-
-
-def main() -> None:
-    print("🔬 HistOrniGraph — NER Stage Runner")
-    print(f"   Model:    {NER_MODEL_ID}")
-    print(f"   Thinking: {NER_THINKING_LEVEL}")
-    print(f"   Skip existing: {SKIP_EXISTING}")
-    print()
-
-    client = _init_client()
-
-    # Resolve target book(s)
-    if BOOK_ROOT_DIR:
-        single = Path(BOOK_ROOT_DIR.rstrip("/"))
-        if not single.is_dir():
-            raise SystemExit(f"❌ BOOK_ROOT_DIR not found: {single}")
-        books = [single]
-        print(f"   Target: single book → {single}")
-    else:
-        root = Path(BOOKS_ROOT_DIR.rstrip("/"))
-        if not root.is_dir():
-            raise SystemExit(f"❌ BOOKS_ROOT_DIR not found: {root}")
-        books = _list_books(root)
-        print(f"   Target: {len(books)} book(s) under {root}")
-        if not books:
-            print("   ⚠ No book folders with a pagexml/ subdirectory found.")
-            return
-
-    summary = []
-    for b in books:
-        summary.append(process_book(client, b))
-
-    # Final summary
-    print("\n📊 Summary")
-    print(f"   {'Book':<32}  {'Pages':>6}  {'OK':>4}  {'Skip':>4}  "
-          f"{'Err':>4}  {'Entities':>8}")
-    for s in summary:
-        print(f"   {s['book']:<32}  {s['pages']:>6}  {s['ok']:>4}  "
-              f"{s['skipped']:>4}  {s['errors']:>4}  {s['total_entities']:>8}")
-
-    grand_total = sum(s["total_entities"] for s in summary)
-    print(f"\n   ✅ Total entities: {grand_total}")
-    print(f"   Output: <book>/{PAGEXML_NER_SUBDIR}/*.xml")
-    print(f"\n   Next: re-run Create_GUIs.py for each book to view entities in the GUI.")
+        out.append({
+            "text":        text,
+            "entity_type": el.get("type", ""),
+            "region_ref":  rid or None,
+            "offset":      offset,
+            "length":      length,
+            "context":     el.get("context") or None,
+        })
+    return out
 
 
-if __name__ == "__main__":
-    main()
+def parse_inline_custom_entities(xml_path: Path) -> List[Dict[str, Any]]:
+    """Read entities from the inline TextRegion ``custom`` attributes.
+
+    This is the canonical store; ``parse_named_entities`` reads the
+    denormalised index block.  Both should agree but this function is the
+    one to use for downstream pipelines (training-data extraction, TEI,
+    Transkribus / eScriptorium import).
+    """
+    if not xml_path.exists():
+        return []
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    out: List[Dict[str, Any]] = []
+    for el in root.iter():
+        if _local(el.tag) != "TextRegion":
+            continue
+        rid = el.get("id", "")
+        custom = el.get("custom", "")
+        if not custom or INLINE_TAG_NAME not in custom:
+            continue
+        text = ""
+        for sub in el.iter():
+            if _local(sub.tag) == "Unicode" and sub.text:
+                text = sub.text
+                break
+        for name, body in _parse_custom(custom):
+            if name != INLINE_TAG_NAME:
+                continue
+            try:
+                offset = int(body.get("offset", "-1"))
+                length = int(body.get("length", "-1"))
+            except ValueError:
+                continue
+            etype = body.get("type", "")
+            etext = text[offset:offset + length] if 0 <= offset < len(text) else ""
+            out.append({
+                "region_ref":  rid,
+                "offset":      offset,
+                "length":      length,
+                "entity_type": etype,
+                "text":        etext,
+            })
+    return out

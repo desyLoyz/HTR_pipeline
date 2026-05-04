@@ -59,6 +59,7 @@ BOOK_ROOT_DIR = globals().get('BOOK_ROOT_DIR_OVERRIDE',
 MD_SUBDIR = "md"
 PAGES_SUBDIR = "pages"
 PAGEXML_SUBDIR = "pagexml"
+PAGEXML_NER_SUBDIR = "pagexml_ner"  # preferred over PAGEXML_SUBDIR if it exists
 
 # Output filename
 OUTPUT_FILENAME = "Laubmann_01_gemini_validation_gui.html"
@@ -68,6 +69,35 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
 # Set to True to automatically share the pages folder (anyone with link)
 AUTO_SHARE_PAGES_FOLDER = True
+
+# ── Named-Entity tag set (mirror of journal_processor/config.py) ──────────
+# Kept here verbatim so this script stays standalone (Colab cell paste-friendly).
+ENTITY_COLORS = {
+    "Animal":               "#c62828",
+    "Artefact":             "#e65100",
+    "Environment":          "#2e7d32",
+    "Environmental Impact": "#bf360c",
+    "Person":               "#6a1b9a",
+    "Location":             "#1565c0",
+    "Organisation":         "#37474f",
+    "Natural Object":       "#5d4037",
+    "Plant":                "#558b2f",
+    "Resource":             "#f9a825",
+    "Climate":              "#546e7a",
+}
+ENTITY_LABELS = {
+    "Animal":               "Tiere",
+    "Artefact":             "Artefakte",
+    "Environment":          "Umgebung",
+    "Environmental Impact": "Umwelteinflüsse",
+    "Person":               "Personen",
+    "Location":             "Orte",
+    "Organisation":         "Organisationen",
+    "Natural Object":       "Naturobjekte",
+    "Plant":                "Pflanzen",
+    "Resource":             "Ressourcen",
+    "Climate":              "Klima",
+}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -218,7 +248,19 @@ def natural_sort_key(s):
 def discover_files(root_dir):
     md_dir = os.path.join(root_dir, MD_SUBDIR)
     pages_dir = os.path.join(root_dir, PAGES_SUBDIR)
-    pagexml_dir = os.path.join(root_dir, PAGEXML_SUBDIR)
+
+    # Prefer NER-annotated pagexml when present, otherwise fall back to the
+    # original pagexml from the layout/HTR stages.
+    pagexml_ner_dir = os.path.join(root_dir, PAGEXML_NER_SUBDIR)
+    pagexml_plain_dir = os.path.join(root_dir, PAGEXML_SUBDIR)
+    if os.path.isdir(pagexml_ner_dir) and any(
+        f.endswith(".xml") for f in os.listdir(pagexml_ner_dir)
+    ):
+        pagexml_dir = pagexml_ner_dir
+        ner_active = True
+    else:
+        pagexml_dir = pagexml_plain_dir
+        ner_active = False
 
     md_files = {}
     if os.path.isdir(md_dir):
@@ -251,12 +293,12 @@ def discover_files(root_dir):
             "md_path": md_files.get(stem, None),
             "pagexml_path": pagexml_files.get(stem, None),
         })
-    return pages
+    return pages, ner_active
 
 
 def parse_pagexml(xml_path):
     if xml_path is None or not os.path.exists(xml_path):
-        return {"width": 0, "height": 0, "regions": []}
+        return {"width": 0, "height": 0, "regions": [], "entities": []}
 
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -284,9 +326,25 @@ def parse_pagexml(xml_path):
     page_height = int(page_el.get('imageHeight', 0)) if page_el is not None else 0
 
     regions = []
+    entities = []
     if page_el is not None:
         for region in page_el:
             tag_name = region.tag.split('}')[-1] if '}' in region.tag else region.tag
+
+            # ── NamedEntities block (added by ner_stage.py) ─────────────
+            if tag_name == 'NamedEntities':
+                for ent in region:
+                    ent_tag = ent.tag.split('}')[-1] if '}' in ent.tag else ent.tag
+                    if ent_tag != 'NamedEntity':
+                        continue
+                    entities.append({
+                        "text": ent.get("text", ""),
+                        "type": ent.get("type", ""),
+                        "regionRef": ent.get("regionRef", ""),
+                        "context": ent.get("context", ""),
+                    })
+                continue
+
             region_id = region.get('id', '')
             region_type = region.get('type', tag_name)
             custom = region.get('custom', '')
@@ -314,7 +372,12 @@ def parse_pagexml(xml_path):
                             "points": points,
                         })
 
-    return {"width": page_width, "height": page_height, "regions": regions}
+    return {
+        "width": page_width,
+        "height": page_height,
+        "regions": regions,
+        "entities": entities,
+    }
 
 
 def read_markdown(md_path):
@@ -329,11 +392,14 @@ def read_markdown(md_path):
 # ═══════════════════════════════════════════════════════════
 
 def build_data(root_dir, image_urls):
-    pages_info = discover_files(root_dir)
+    pages_info, ner_active = discover_files(root_dir)
     book_name = os.path.basename(root_dir.rstrip("/"))
 
     data = {
         "bookName": book_name,
+        "nerActive": ner_active,
+        "entityColors": ENTITY_COLORS,
+        "entityLabels": ENTITY_LABELS,
         "pages": [],
     }
 
@@ -1023,6 +1089,64 @@ def generate_html(data):
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner-text { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-muted); }
 
+  /* ── Named-Entity highlighting (preview tab) ── */
+  .entity {
+    padding: 1px 3px;
+    border-radius: 3px;
+    border-bottom: 2px solid currentColor;
+    background-color: color-mix(in srgb, currentColor 14%, transparent);
+    color: inherit;
+  }
+  .entity-tag {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 4px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 14px;
+    color: #fff;
+    border-radius: 2px;
+    vertical-align: 2px;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+  }
+  .entity-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    align-items: center;
+  }
+  .entity-legend.hidden { display: none; }
+  .entity-legend-title {
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-right: 4px;
+  }
+  .entity-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: default;
+    user-select: none;
+    color: var(--text-secondary);
+  }
+  .entity-legend-item.empty { opacity: 0.35; }
+  .entity-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+  }
+  .entity-legend-count {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
   @media (max-width: 800px) {
     .main-container { flex-direction: column; }
     .divider { width: auto; height: 4px; cursor: row-resize; }
@@ -1048,6 +1172,7 @@ def generate_html(data):
   </div>
   <div class="topbar-controls">
     <button class="toggle-btn" id="btnRegions" title="Toggle layout regions (R)">&#9638; Regions</button>
+    <button class="toggle-btn active" id="btnEntities" title="Toggle named-entity highlights (E)">&#9873; Entities</button>
     <button class="toggle-btn" id="btnFitWidth" title="Fit to width (F)">&#10530; Fit</button>
     <button class="import-btn" id="btnImport" title="Import a previously exported session JSON">&#8593; Import session</button>
     <input type="file" id="sessionFileInput" accept=".json" style="display:none">
@@ -1149,6 +1274,7 @@ def generate_html(data):
       <span class="done-timestamp" id="doneTimestamp"></span>
     </div>
     <div class="editor-wrapper">
+      <div class="entity-legend hidden" id="entityLegend"></div>
       <div class="editor-tabs">
         <div class="editor-tab active" data-tab="edit">Edit</div>
         <div class="editor-tab" data-tab="preview">Preview</div>
@@ -1171,6 +1297,7 @@ def generate_html(data):
     <kbd>D</kbd> done &nbsp;
     <kbd>Shift+D</kbd> redo &nbsp;
     <kbd>R</kbd> regions &nbsp;
+    <kbd>E</kbd> entities &nbsp;
     <kbd>F</kbd> fit &nbsp;
     <kbd>[</kbd><kbd>]</kbd> rotate &nbsp;
     <kbd>+</kbd><kbd>-</kbd> zoom
@@ -1184,6 +1311,7 @@ const STORAGE_KEY = 'histornigraph_session_' + DATA.bookName;
 
 let currentPageIdx = 0;
 let showRegions = false;
+let showEntities = true;     // entity highlighting in preview (default ON)
 let zoom = 1, panX = 0, panY = 0;
 let isPanning = false, panStartX = 0, panStartY = 0;
 let edits = {};
@@ -1205,6 +1333,7 @@ const pageSelect = $('pageSelect');
 const btnPrev = $('btnPrev');
 const btnNext = $('btnNext');
 const btnRegions = $('btnRegions');
+const btnEntities = $('btnEntities');
 const btnFitWidth = $('btnFitWidth');
 const btnExport = $('btnExport');
 const btnImport = $('btnImport');
@@ -1711,6 +1840,7 @@ function loadPage(idx) {
   updateDirtyState();
   updateDoneDisplay();
   updateRedoDisplay();
+  updateEntityLegend();
   pageLoaded = true;
 
   scheduleAutoSave();
@@ -1785,6 +1915,27 @@ function escHtml(s) { var d = document.createElement('div'); d.textContent = s; 
 // ZOOM / PAN  (rotation is a CSS transform on the img+svg wrapper)
 // ══════════════════════════════════════════════════════════
 
+/**
+ * Canonical page dimensions for the current page.
+ *
+ * We trust the PageXML's <Page imageWidth/imageHeight> over the image's
+ * naturalWidth/Height because Drive thumbnails are capped at sz=w2000:
+ * a 3350-px-wide unsplit page is served to the browser as 2000 px, so
+ * naturalWidth=2000 while the PageXML region polygons are in 3350-coord
+ * space.  Forcing the rendered image and SVG to share PageXML's coord
+ * space realigns full pages without affecting split pages (which are
+ * under the cap and so happen to match either way).
+ *
+ * Falls back to naturalWidth/Height if the PageXML is missing.
+ */
+function pageOrigDims() {
+  var page = DATA.pages[currentPageIdx];
+  var pxml = page && page.pagexml;
+  var w = (pxml && pxml.width)  || pageImage.naturalWidth  || 0;
+  var h = (pxml && pxml.height) || pageImage.naturalHeight || 0;
+  return [w, h];
+}
+
 function updateTransform() {
   // The image itself is rotated via CSS on the img element.
   // The imageContainer is then panned/zoomed as before.
@@ -1792,11 +1943,21 @@ function updateTransform() {
   pageImage.style.transform = 'rotate(' + imageRotation + 'deg)';
   pageImage.style.transformOrigin = 'top left';
 
-  // For 90°/270° the image's bounding box in the DOM is still the original size
-  // but the visual rotates. To handle layout correctly we adjust the container
-  // size to match the rotated dimensions.
-  var origW = pageImage.naturalWidth  || 0;
-  var origH = pageImage.naturalHeight || 0;
+  // Use PageXML's logical page dims (not naturalWidth/Height) so that the
+  // visible image, SVG overlay and polygon coordinates all share one
+  // coordinate space — see pageOrigDims() comment.
+  var origDims = pageOrigDims();
+  var origW = origDims[0];
+  var origH = origDims[1];
+
+  // Pin the rendered image to the canonical dims so it scales (up or down)
+  // to match the polygon coordinate space.  This is the actual fix for
+  // the full-page overlay misalignment.
+  if (origW > 0 && origH > 0) {
+    pageImage.style.width  = origW + 'px';
+    pageImage.style.height = origH + 'px';
+  }
+
   var dims = rotatedDimensions(origW, origH, imageRotation);
   var canvasW = dims[0];
   var canvasH = dims[1];
@@ -1835,8 +1996,9 @@ function zoomTo(newZoom, cx, cy) {
 
 function fitToWidth() {
   var vw = imageViewport.clientWidth;
-  var origW = pageImage.naturalWidth  || 1;
-  var origH = pageImage.naturalHeight || 1;
+  var origDims = pageOrigDims();
+  var origW = origDims[0] || 1;
+  var origH = origDims[1] || 1;
   var dims = rotatedDimensions(origW, origH, imageRotation);
   var canvasW = dims[0];
   zoom = (vw - 20) / canvasW;
@@ -1882,9 +2044,166 @@ function renderMarkdown(text) {
   return h;
 }
 
-function updatePreview(text) { markdownPreview.innerHTML = renderMarkdown(text); }
+function updatePreview(text) {
+  markdownPreview.innerHTML = renderMarkdown(text);
+  applyEntityHighlights();
+}
 function updateCharCount(text) {
   charCount.textContent = text.split('\n').length + ' lines \u00b7 ' + text.length + ' chars';
+}
+
+// ══════════════════════════════════════════════════════════
+// NAMED ENTITIES — preview highlighting + legend
+// ══════════════════════════════════════════════════════════
+
+const ENTITY_COLORS = DATA.entityColors || {};
+const ENTITY_LABELS = DATA.entityLabels || {};
+
+function currentPageEntities() {
+  var page = DATA.pages[currentPageIdx];
+  var pxml = page && page.pagexml;
+  return (pxml && Array.isArray(pxml.entities)) ? pxml.entities : [];
+}
+
+function escRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Walk text nodes inside the markdown preview and wrap occurrences of
+ * entity texts in <span class="entity"> tags. Longest entities are
+ * matched first so "grauen Fliegenschnäpper" beats "Fliegenschnäpper"
+ * to a shared span. Skips text already inside .entity / <code> / <pre>.
+ */
+function applyEntityHighlights() {
+  if (!showEntities) return;
+  var entities = currentPageEntities();
+  if (!entities.length) return;
+
+  // Sort longest-first to handle overlapping/nested entity texts deterministically.
+  var sorted = entities.slice().sort(function(a, b) {
+    return (b.text || '').length - (a.text || '').length;
+  });
+
+  // Combined regex (case-sensitive — the NER prompt requires exact-case matches).
+  var pattern = sorted
+    .filter(function(e) { return e && e.text; })
+    .map(function(e) { return escRegex(e.text); })
+    .join('|');
+  if (!pattern) return;
+  var rx = new RegExp(pattern);
+
+  // Build a quick lookup: text → entity (longest already wins via sort order).
+  var byText = {};
+  sorted.forEach(function(e) {
+    if (e && e.text && byText[e.text] === undefined) byText[e.text] = e;
+  });
+
+  function shouldSkip(node) {
+    var p = node.parentNode;
+    while (p && p !== markdownPreview) {
+      if (p.nodeType === 1) {
+        var tag = p.tagName;
+        if (tag === 'CODE' || tag === 'PRE') return true;
+        if (p.classList && p.classList.contains('entity')) return true;
+      }
+      p = p.parentNode;
+    }
+    return false;
+  }
+
+  // Collect text nodes first — modifying the tree mid-walk is fragile.
+  var walker = document.createTreeWalker(markdownPreview, NodeFilter.SHOW_TEXT, null);
+  var nodes = [];
+  var n;
+  while ((n = walker.nextNode())) nodes.push(n);
+
+  nodes.forEach(function(node) {
+    if (!node.nodeValue || shouldSkip(node)) return;
+    var txt = node.nodeValue;
+    if (!rx.test(txt)) return;
+
+    var frag = document.createDocumentFragment();
+    var lastIdx = 0;
+    var globalRx = new RegExp(pattern, 'g');
+    var m;
+    while ((m = globalRx.exec(txt)) !== null) {
+      var matchText = m[0];
+      var ent = byText[matchText];
+      if (!ent) { lastIdx = globalRx.lastIndex; continue; }
+
+      // Push leading text
+      if (m.index > lastIdx) {
+        frag.appendChild(document.createTextNode(txt.slice(lastIdx, m.index)));
+      }
+      // Build span
+      var span = document.createElement('span');
+      span.className = 'entity';
+      var color = ENTITY_COLORS[ent.entity_type || ent.type] || '#666';
+      span.style.color = color;
+      span.title = (ENTITY_LABELS[ent.entity_type || ent.type]
+                    || ent.entity_type || ent.type || '')
+                   + (ent.context ? '  —  ' + ent.context : '');
+      span.textContent = matchText;
+      frag.appendChild(span);
+      lastIdx = globalRx.lastIndex;
+
+      // Guard against zero-width matches
+      if (m.index === globalRx.lastIndex) globalRx.lastIndex++;
+    }
+    // Trailing text
+    if (lastIdx < txt.length) {
+      frag.appendChild(document.createTextNode(txt.slice(lastIdx)));
+    }
+    node.parentNode.replaceChild(frag, node);
+  });
+}
+
+/**
+ * Rebuild the entity legend strip above the editor tabs.  One chip per
+ * entity type with a colour swatch and the count of occurrences on the
+ * current page; types with zero hits are dimmed.  The whole strip is
+ * hidden when the page has no entities at all (or NER hasn't been run).
+ */
+function updateEntityLegend() {
+  var legend = $('entityLegend');
+  if (!legend) return;
+  var entities = currentPageEntities();
+
+  if (!showEntities || !entities.length) {
+    legend.classList.add('hidden');
+    legend.innerHTML = '';
+    return;
+  }
+
+  // Count per type (preserve the canonical type order from ENTITY_LABELS)
+  var counts = {};
+  entities.forEach(function(e) {
+    var t = e.entity_type || e.type;
+    if (!t) return;
+    counts[t] = (counts[t] || 0) + 1;
+  });
+
+  var types = Object.keys(ENTITY_LABELS);
+  // Append any unknown types we encountered (shouldn't happen, but be safe)
+  Object.keys(counts).forEach(function(t) {
+    if (types.indexOf(t) === -1) types.push(t);
+  });
+
+  var html = '<span class="entity-legend-title">Entities</span>';
+  types.forEach(function(t) {
+    var c = counts[t] || 0;
+    var color = ENTITY_COLORS[t] || '#666';
+    var label = ENTITY_LABELS[t] || t;
+    html += '<span class="entity-legend-item' + (c === 0 ? ' empty' : '') + '" '
+          + 'title="' + escHtml(t) + '">'
+          + '<span class="entity-legend-swatch" style="background:' + color + '"></span>'
+          + escHtml(label)
+          + '<span class="entity-legend-count">' + c + '</span>'
+          + '</span>';
+  });
+  legend.innerHTML = html;
+  legend.classList.remove('hidden');
 }
 
 function updateDirtyState() {
@@ -2042,6 +2361,18 @@ function setupEvents() {
     regionLegend.style.display = showRegions ? 'flex' : 'none';
   });
 
+  btnEntities.addEventListener('click', function() {
+    showEntities = !showEntities;
+    btnEntities.classList.toggle('active', showEntities);
+    var page = DATA.pages[currentPageIdx];
+    if (page) {
+      // Re-render preview from the current text so entity spans appear/disappear cleanly
+      var md = edits[page.stem] !== undefined ? edits[page.stem] : page.markdown;
+      updatePreview(md);
+    }
+    updateEntityLegend();
+  });
+
   btnFitWidth.addEventListener('click', fitToWidth);
   $('btnZoomIn').addEventListener('click', function() { zoomTo(zoom * 1.3); });
   $('btnZoomOut').addEventListener('click', function() { zoomTo(zoom / 1.3); });
@@ -2129,6 +2460,7 @@ function setupEvents() {
     if (e.key === 'ArrowLeft')  { loadPage(currentPageIdx - 1); e.preventDefault(); }
     if (e.key === 'ArrowRight') { loadPage(currentPageIdx + 1); e.preventDefault(); }
     if (e.key === 'r' || e.key === 'R') { if (!e.shiftKey) btnRegions.click(); }
+    if (e.key === 'e' || e.key === 'E') { if (!e.shiftKey) btnEntities.click(); }
     if (e.key === 'f' || e.key === 'F') fitToWidth();
     if ((e.key === 'd' || e.key === 'D') && e.shiftKey) { togglePageRedo(); e.preventDefault(); }
     else if (e.key === 'd' || e.key === 'D') togglePageDone();
@@ -2197,10 +2529,18 @@ def main():
     with_drive = sum(1 for p in data['pages'] if p['imagePath'] and 'drive.google.com' in str(p['imagePath']))
     with_md = sum(1 for p in data['pages'] if p['markdown'])
     with_xml = sum(1 for p in data['pages'] if p['pagexml']['regions'])
+    with_ents = sum(1 for p in data['pages'] if p['pagexml'].get('entities'))
+    total_ents = sum(len(p['pagexml'].get('entities', [])) for p in data['pages'])
     print(f"   Pages: {total}")
     print(f"   With images: {with_img} ({with_drive} via Drive URLs)")
     print(f"   With transcriptions: {with_md}")
     print(f"   With layout regions: {with_xml}")
+    if data.get('nerActive'):
+        print(f"   With named entities: {with_ents} pages, {total_ents} entities total"
+              f" (using {PAGEXML_NER_SUBDIR}/)")
+    else:
+        print(f"   Named entities: not yet run "
+              f"(no {PAGEXML_NER_SUBDIR}/ folder — run Run_NER_Stage.py first)")
     print()
 
     print("\U0001f3d7\ufe0f  Generating HTML...")

@@ -80,7 +80,10 @@ PAGEXML_SUBDIR = "pagexml"
 PAGEXML_NER_SUBDIR = "pagexml_ner"  # preferred over PAGEXML_SUBDIR if it exists
 
 # Output filename
-OUTPUT_FILENAME = "Laubmann_01_gemini_validation_gui.html"
+# Leave as None to auto-derive: "<book-folder>_validation_gui.html",
+# or "<book-folder>_validation_gui_ner.html" when NER results are present.
+# Override from a notebook cell with:    OUTPUT_FILENAME_OVERRIDE = "my_name.html"
+OUTPUT_FILENAME = globals().get('OUTPUT_FILENAME_OVERRIDE', None)
 
 # Image extensions to look for
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -2759,7 +2762,15 @@ def main():
     print("\U0001f3d7\ufe0f  Generating HTML...")
     html = generate_html(data)
 
-    output_path = os.path.join(root, OUTPUT_FILENAME)
+    # Resolve the output filename: explicit override wins, otherwise auto-derive
+    # from the book folder name + whether NER results are present.
+    if OUTPUT_FILENAME:
+        output_filename = OUTPUT_FILENAME
+    else:
+        suffix = "_validation_gui_ner.html" if data.get('nerActive') else "_validation_gui.html"
+        output_filename = f"{book_name}{suffix}"
+
+    output_path = os.path.join(root, output_filename)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html)
 
@@ -2768,7 +2779,7 @@ def main():
     print(f"   Size: {size_kb:.1f} KB")
     print()
     print("\U0001f4a1 Usage:")
-    print(f"   1. Download {OUTPUT_FILENAME}")
+    print(f"   1. Download {output_filename}")
     print(f"   2. Open in any browser")
     if with_drive > 0:
         print(f"   3. Images load from Google Drive (folder is shared)")

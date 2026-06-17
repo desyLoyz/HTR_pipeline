@@ -1,7 +1,7 @@
 """Generate PAGE XML (PAGE Content Schema) for each page.
 
-Produces a simplified but valid PAGE XML 2019 document with layout regions
-and their transcription results.
+Each extracted region record becomes a TextRegion.  Bounding boxes are
+approximate vertical bands (single-pass mode does not detect layout boxes).
 """
 
 import logging
@@ -15,18 +15,6 @@ log = logging.getLogger(__name__)
 
 PAGE_NS = "http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"
 
-# Map our region types → PAGE XML element names
-_PAGE_XML_TYPE = {
-    "ParagraphRegion": "TextRegion",
-    "ListRegion": "TextRegion",
-    "FootnoteRegion": "TextRegion",
-    "MarginaliaRegion": "TextRegion",
-    "PageNumberRegion": "TextRegion",
-    "TableRegion": "TableRegion",
-    "ImageRegion": "ImageRegion",
-    "ObjectRegion": "GraphicRegion",
-}
-
 
 def _coords_str(bbox: Dict[str, int]) -> str:
     """Convert bbox dict → PAGE XML Points string (polygon)."""
@@ -36,7 +24,7 @@ def _coords_str(bbox: Dict[str, int]) -> str:
 
 def generate_pagexml(
     page_id: str,
-    regions: List[Dict[str, Any]],
+    records: List[Dict[str, Any]],
     image_dims: Dict[str, int],
     image_filename: str,
     output_dir: Path,
@@ -59,29 +47,32 @@ def generate_pagexml(
     reading_order_el = SubElement(page, "ReadingOrder")
     og = SubElement(reading_order_el, "OrderedGroup", id="reading_order")
 
-    for r in sorted(regions, key=lambda r: r["reading_order"]):
-        rid = r["id"]
-        rtype = r["type"]
-        xml_tag = _PAGE_XML_TYPE.get(rtype, "TextRegion")
-        bbox = r["bbox"]
+    for rec in sorted(records, key=lambda r: r["reading_order"]):
+        rid = rec["id"]
+        bbox = rec.get("bbox", {"x": 0, "y": 0, "width": image_dims["width"], "height": image_dims["height"]})
 
-        SubElement(og, "RegionRefIndexed", index=str(r["reading_order"]), regionRef=rid)
+        SubElement(og, "RegionRefIndexed", index=str(rec["reading_order"]), regionRef=rid)
 
-        region_el = SubElement(page, xml_tag, id=rid, custom=f"type:{rtype}")
+        custom_parts = [
+            f"type:{rec.get('type', 'RegionRecord')}",
+            f"record_number:{rec.get('record_number', '')}",
+            f"date:{rec.get('date', '')}",
+        ]
+        if rec.get("marginal_reference"):
+            custom_parts.append(f"marginal_reference:{rec['marginal_reference']}")
+        if rec.get("end_line"):
+            custom_parts.append(f"end_line:{rec['end_line']}")
+
+        region_el = SubElement(page, "TextRegion", id=rid, custom=" ".join(custom_parts))
         SubElement(region_el, "Coords", points=_coords_str(bbox))
 
-        # Transcription
-        text = r.get("transcription", {}).get("text", "")
-        if text and xml_tag == "TextRegion":
-            te = SubElement(region_el, "TextEquiv")
-            SubElement(te, "Unicode").text = text
-        elif text and xml_tag == "TableRegion":
+        text = rec.get("transcription", {}).get("text", "")
+        if text:
             te = SubElement(region_el, "TextEquiv")
             SubElement(te, "Unicode").text = text
 
     xml_str = tostring(root, encoding="unicode")
     pretty = minidom.parseString(xml_str).toprettyxml(indent="  ", encoding=None)
-    # Remove extra xml declaration minidom adds
     pretty = "\n".join(pretty.splitlines()[1:])
 
     out_path = output_dir / f"{page_id}.xml"

@@ -21,8 +21,7 @@ log = logging.getLogger(__name__)
 
 _TEXT_PROMPT = """\
 Transcribe the German text in this image exactly as written, \
-character by character, line by line. It is part of a german ornithologists journal. 
-Locations, as well as species are typically <u>underlined</u>. 
+character by character, line by line. It is part of an archival index for court records.
 
 Region type: {region_type}
 

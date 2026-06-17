@@ -1,87 +1,73 @@
-"""Generate Markdown reconstruction of each page.
-
-MarginaliaRegion is intentionally excluded from Markdown output — marginalia
-are peripheral annotations that clutter reading flow.  They remain present in
-PageXML, ShareGPT, and the regions JSON.
-"""
+"""Generate Markdown reconstruction of each page from extracted records."""
 
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
-
-from .config import MD_EXCLUDED_TYPES
 
 log = logging.getLogger(__name__)
 
 
 def generate_md(
     page_id: str,
-    regions: List[Dict[str, Any]],
+    records: List[Dict[str, Any]],
     output_dir: Path,
 ) -> Path:
-    """Write a Markdown file that reconstructs the full page content.
+    """Write a Markdown file with all extracted region records on the page."""
+    lines: List[str] = [f"# {page_id}", ""]
 
-    Regions are rendered in reading order with type-appropriate formatting.
-    """
-    lines: List[str] = []
-
-    # Page-level header with detected page number (if any)
-    page_num = _find_page_number(regions)
-    header = f"# Page {page_num}" if page_num else f"# {page_id}"
-    lines.append(header)
-    lines.append("")
-
-    for r in sorted(regions, key=lambda r: r["reading_order"]):
-        rtype = r["type"]
-
-        # Skip types excluded from MD output (e.g. MarginaliaRegion)
-        if rtype in MD_EXCLUDED_TYPES:
-            continue
-
-        # Skip folded inserts — nothing readable to render
-        if r.get("insert_state") == "folded":
-            continue
-
-        text = r.get("transcription", {}).get("text", "")
+    for rec in sorted(records, key=lambda r: r["reading_order"]):
+        text = rec.get("transcription", {}).get("text", "")
         if not text:
             continue
 
-        if rtype == "PageNumberRegion":
-            # Already used in header; skip body
-            continue
+        n = rec.get("reading_order", 0)
+        lines.append(f"## Region Record {n}")
+        lines.append("")
+        lines.append("| Tag | Extracted value |")
+        lines.append("|---|---|")
+        lines.append(f"| **Record number** | **{rec.get('record_number', '')}** |")
+        lines.append(f"| **Date** | **{rec.get('date', '')}** |")
+        marginal = rec.get("marginal_reference") or ""
+        lines.append(f"| **Marginal note / later reference** | **{marginal}** |")
+        lines.append(
+            f"| **Record type** | {rec.get('record_type', 'Numbered dated archival regest / region record')} |"
+        )
+        end_line = rec.get("end_line", "")
+        lines.append(f"| **End line / seal formula** | `{end_line}` |")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("## Diplomatic transcription")
+        lines.append("")
+        lines.append("```text")
+        lines.append(text)
+        lines.append("```")
+        lines.append("")
 
-        if rtype in ("ParagraphRegion", "ListRegion", "FootnoteRegion"):
-            if rtype == "FootnoteRegion":
-                lines.append(f"[^footnote]: {text}")
-            else:
-                lines.append(text)
+        xml_block = rec.get("transcription", {}).get("xml", "")
+        if xml_block:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Categorized structure")
+            lines.append("")
+            lines.append("```xml")
+            lines.append(xml_block.strip())
+            lines.append("```")
             lines.append("")
 
-        elif rtype == "TableRegion":
-            lines.append(text)  # already in Markdown table format
+        notes = rec.get("transcription", {}).get("uncertainty_notes") or []
+        if notes:
+            lines.append("---")
+            lines.append("")
+            lines.append("## Notes on certainty")
+            lines.append("")
+            for note in notes:
+                lines.append(f"- {note}")
             lines.append("")
 
-        elif rtype in ("ImageRegion", "ObjectRegion"):
-            desc = r.get("transcription", {}).get("description", text)
-            dtype = r.get("transcription", {}).get("drawing_type",
-                    r.get("transcription", {}).get("object_type", "unknown"))
-            visible = r.get("transcription", {}).get("visible_text", "")
-            lines.append(f"*[{rtype}: {dtype}]* {desc}")
-            if visible and visible.lower() != "none":
-                lines.append(f"Text: {visible}")
-            lines.append("")
+        lines.append("")
 
     md_path = output_dir / f"{page_id}.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")
     log.debug("Wrote %s", md_path.name)
     return md_path
-
-
-def _find_page_number(regions: List[Dict]) -> str:
-    """Extract page number from PageNumberRegion if present."""
-    for r in regions:
-        if r["type"] == "PageNumberRegion":
-            pn = r.get("page_number") or r.get("transcription", {}).get("text", "")
-            if pn:
-                return str(pn)
-    return ""

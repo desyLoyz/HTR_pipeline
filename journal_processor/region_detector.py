@@ -1,211 +1,241 @@
-"""Region detection using Gemini 3 Flash Preview.
-
-Two prompt variants:
-  DETECTION_PROMPT        – single-page (after splitting, or a single-page scan)
-  DETECTION_PROMPT_DOUBLE – full double-page scan
-
-The double-page prompt enforces:
-  • Each physical insert is ONE region (no sub-region splitting by content type)
-  • Folded inserts get a dedicated region with insert_state="folded" so the
-    transcriber can skip them gracefully
-"""
+"""Single-pass region detection and structured extraction using Gemini."""
 
 import json
 import logging
+import re
 import traceback
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PIL import Image
-
-from .config import REGION_TYPES, MAX_REGIONS_PER_PAGE, PipelineConfig
+from .config import PipelineConfig
 from .utils import MIME_BY_EXT, clean_llm_json
 
 log = logging.getLogger(__name__)
 
 
-# ── Prompts ──────────────────────────────────────────────────────────────────
+# ── Prompt ───────────────────────────────────────────────────────────────────
 
-# Single-page prompt — used after the scan has been split into L/R halves,
-# or when the analyser determines the scan is already a single page.
-DETECTION_PROMPT = """\
-You are a document-layout analyst for digitised pages of a German ornithologist's \
-handwritten/printed field journal (19th–20th century).
+EXTRACTION_PROMPT = """\
+# Task: Region Detection and Structured Extraction from German Archival Register Page
 
-TASK: Detect every distinct content region on this page and return precise \
-bounding boxes.  Try to keep whole journal entries together — an entry \
-typically begins with a date and city/location name.  Do NOT split a single \
-entry across multiple regions unless it clearly changes type (e.g. a table \
-inside an entry).
+You are analyzing a scanned historical German archival register page written mainly \
+in 19th-century German Kurrent handwriting, with some Latin-script marginalia, \
+numbers, dates, and file references.
 
-COORDINATE SYSTEM
-Normalised 0–1000 scale.  (0, 0) = top-left, (1000, 1000) = bottom-right.
-bbox format: {{"x": left, "y": top, "width": w, "height": h}}
+Your task is to detect, segment, and transcribe each distinct numbered and dated record \
+on this page.
 
-REGION TYPES (use exactly these names):
-ParagraphRegion · ListRegion · TableRegion · ObjectRegion · PageNumberRegion · \
-MarginaliaRegion · FootnoteRegion · ImageRegion · InsertRegion
+## 1. Definition of a Region Record
 
-INSERT SHEETS
-If any type of paper insert is visible in this image, treat its entire
-visible insert as a single InsertRegion (do not subdivide it) and add:
-  "page_side": "insert", "insert_id": 1, "insert_state": "visible"
-If the insert is folded and unreadable, use type "InsertRegion" and add:
-  "page_side": "insert", "insert_id": 1, "insert_state": "folded"
+A **region record** is one complete archival entry. It usually consists of:
 
-RULES
-1. Maximum {max_regions} regions – merge small adjacent blocks of the same type.
-2. Tight bounding boxes, no overlaps.
-3. Reading order = natural top-to-bottom, left-to-right sequence.
+1. A **record number** on the far left margin or at the beginning of a line.
+2. An associated **date**, usually written near the number.
+3. Optional **marginal references**, often written left of the main text, e.g. `jetzt: Kurbaiern 20381`.
+4. The **main body text**, written in Kurrent.
+5. A closing or source line, often beginning and ending with `/: ... :/`, typically mentioning:
+   - `Or.`
+   - `Perg.`
+   - `Siegel`
+   - `anh. Siegel`
+   - `abgeg. Siegel`
+   - or similar archival/seal information.
 
-EXTRA METADATA per region:
-• PageNumberRegion → "page_number": <int or string>.
-• ParagraphRegion / ListRegion / FootnoteRegion → "line_count": <int>.
-• TableRegion → "rows": <int>, "cols": <int>.
+Each numbered and dated entry should be treated as one distinct record.
 
-OUTPUT (JSON only, no commentary):
-{{"regions": [
-  {{"id": "r1", "type": "…", "bbox": {{"x":…,"y":…,"width":…,"height":…}}, \
-"reading_order": 1, …metadata…}},
-  …
-], "total_regions": N}}
-"""
+## 2. Region Boundaries
 
-# Double-page prompt — used when the full unsplit scan is sent to the detector.
-DETECTION_PROMPT_DOUBLE = """\
-You are a document-layout analyst for digitised double-page scans of a German \
-ornithologist's handwritten field journal (20th century).
+Detect the start and end of each record carefully.
 
-CONTEXT
-This image contains TWO journal pages side by side (left page and right page).
-It may also contain loose INSERT sheets — separate pieces of paper tucked inside
-the journal that overlap one or both main pages.
+### Start of a record
 
-TASK: Detect every distinct content region across BOTH pages and any inserts,
-then return precise bounding boxes with metadata.  Keep whole journal entries
-together — an entry typically begins with a date and city/location name.  Do NOT
-split a single entry across multiple regions unless it clearly changes type
-(e.g. a table inside an entry).
+A record usually begins where one or more of the following appear:
 
-COORDINATE SYSTEM
-Normalised 0–1000 scale.  (0, 0) = top-left, (1000, 1000) = bottom-right.
-bbox format: {{"x": left, "y": top, "width": w, "height": h}}
+- A far-left **record number**, e.g. `7.`, `8.`, `9.`, `10.`
+- A date immediately after or near the number, e.g. `1340, Novemb. 26.`
+- A red/blue/black marginal mark or underline next to a new entry
+- A new block of main text aligned horizontally with a date/number
 
-REGION TYPES (use exactly these names):
-ParagraphRegion · ListRegion · TableRegion · ObjectRegion · PageNumberRegion · \
-MarginaliaRegion · FootnoteRegion · ImageRegion · InsertRegion
+### End of a record
 
-PAGE ASSIGNMENT — required for every region:
-• "page_side": "left" | "right" | "insert"
-  – "left"   → belongs to the left-hand main page
-  – "right"  → belongs to the right-hand main page
-  – "insert" → belongs to a loose insert sheet
+A record usually ends at the line containing an archival source or seal formula, often shaped like:
 
-INSERT RULES — read carefully:
-① Group all content from the SAME physical insert under one "insert_id" integer
-  (insert_id: 1, 2, …).
-② A FULLY VISIBLE insert MUST be captured as a SINGLE region with one bounding box
-  that encloses the entire insert — do NOT subdivide it into separate paragraph /
-  table / image sub-regions.  Use the region type InsertRegion and add "page_side": "insert", "insert_id": 1, "insert_state": "visible"
-③ A FOLDED insert (showing only its back or blank/exterior side — no readable
-  text) → create exactly ONE region with:
-    type: "InsertRegion", page_side: "insert", insert_id: <n>,
-    insert_state: "folded"
-  Do NOT create sub-regions inside a folded insert.
+- `/: Or. (Perg.) mit anh. Siegel ... :/`
+- `/: Or. (Perg.) ... Siegel ... :/`
+- `/: ... Siegel ... :/`
 
+If the closing seal/source line is unclear, end the record immediately before the next \
+detected numbered/date entry.
 
-INSERT STATE — required for every insert region:
-• "insert_state": "visible"  → readable content
-• "insert_state": "folded"   → back/exterior only, not readable
+## 3. Transcription Rules
 
-RULES
-1. Maximum {max_regions} regions total across both pages and all inserts.
-   Merge small adjacent same-type blocks rather than creating many tiny regions.
-2. Tight bounding boxes, no overlaps.
-3. Reading order = left-to-right, top-to-bottom
-   (left page first, then right page, inserts interleaved by their position).
+Use **diplomatic transcription**.
 
-EXTRA METADATA per region:
-• PageNumberRegion → "page_number": <int or string>.
-• ParagraphRegion / ListRegion / FootnoteRegion → "line_count": <int>.
-• TableRegion → "rows": <int>, "cols": <int>.
+Preserve:
 
-OUTPUT (JSON only, no commentary):
-{{"regions": [
-  {{"id": "r1", "type": "…", "page_side": "left", \
-"bbox": {{"x":…,"y":…,"width":…,"height":…}}, "reading_order": 1, …metadata…}},
-  …
-], "total_regions": N}}
+- original spelling
+- capitalization
+- abbreviations
+- punctuation
+- line breaks where possible
+- hyphenation at line breaks
+- marginalia
+- dates and numbers exactly as written
+- source/seal formulas exactly as written
+
+Do **not**:
+
+- modernize spelling
+- translate the text
+- silently expand abbreviations
+- merge uncertain words into guessed modern forms
+- omit marginal references
+- omit the final source/seal line
+
+## 4. Handling Mixed Scripts
+
+The document uses mixed scripts.
+
+Recognize that:
+
+- Main body text is usually German Kurrent.
+- Dates, numbers, marginal references, headings, and some proper names may be in Latin \
+cursive or print-like script.
+- Marginal annotations such as `jetzt: Kurbaiern 20381` belong to the same record if \
+horizontally aligned with that record.
+
+## 5. Tagging Rules
+
+For every record, identify and tag in `xml_structure`:
+
+### Required tags
+
+- `<record_number>`
+- `<date>`
+- `<body>`
+- `<end_line>`
+
+### Optional but important tags
+
+- `<marginal_reference>`
+- `<datum_line>`
+- `<place_names>`
+- `<personal_names>`
+- `<archive_reference>`
+- `<seal_information>`
+- `<uncertain_readings>`
+
+## 6. Marginal Notes
+
+Marginal notes should not be treated as separate records unless they have their own \
+number and date.
+
+Associate a marginal note with the record whose horizontal text block it aligns with.
+
+## 7. Uncertainty Marking
+
+Use these conventions in `diplomatic_transcription`:
+
+- `[unclear]` = unreadable word or passage
+- `word[?]` = tentative reading
+- `[... ]` = omitted or illegible portion inside a word/phrase
+- Do not invent missing words.
+- If the seal formula is partly unreadable, transcribe the visible part and mark the \
+rest as `[unclear]`.
+
+## 8. Record Completeness
+
+Detect every **full** numbered and dated record on the page (up to {max_records} records).
+
+Do not start with partial text at the top of the page if that text belongs to a previous \
+incomplete entry. Ignore incomplete continuation text above the first clearly numbered entry.
+
+Each record must have:
+
+1. visible record number,
+2. visible date,
+3. main text,
+4. closing source/seal line (or end before the next record if unclear).
+
+## 9. Quality Control Checklist
+
+Before finalizing, verify for each record:
+
+- Correct start of the record
+- Far-left number included
+- Date included
+- Marginal notes associated correctly
+- Complete body transcribed
+- Closing `/: ... :/` source/seal line included
+- No text from previous or next record
+- Spelling and abbreviations preserved
+- Uncertain readings marked instead of guessed
+
+## 10. Output format (JSON only)
+
+Return **only** a JSON object — no commentary, no markdown fences, no reasoning text.
+
+Schema:
+
+{{"records": [
+  {{
+    "record_number": "<string>",
+    "date": "<string>",
+    "marginal_reference": "<string or null>",
+    "record_type": "Numbered dated archival regest / region record",
+    "end_line": "<string>",
+    "diplomatic_transcription": "<complete diplomatic transcription>",
+    "xml_structure": "<record>...</record>",
+    "uncertainty_notes": ["<note>", "..."]
+  }}
+]}}
+
+Rules:
+
+- Include every distinct numbered and dated record on the page, in top-to-bottom order.
+- Maximum {max_records} records.
+- `xml_structure` must be a single well-formed `<record>...</record>` element.
+- `uncertainty_notes` may be an empty array.
 """
 
 
 class RegionDetector:
-    """Detect and classify layout regions with Gemini 3 Flash."""
+    """Single-pass detection and structured extraction with Gemini."""
 
     def __init__(self, client: Any, cfg: PipelineConfig) -> None:
         self.client = client
         self.cfg = cfg
 
-    # ── margin helper ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _add_margin(
-        bbox: Dict, img_w: int, img_h: int, margin_frac: float
-    ) -> Dict[str, int]:
-        mx = int(img_w * margin_frac)
-        my = int(img_h * margin_frac)
-        x = max(0, bbox["x"] - mx)
-        y = max(0, bbox["y"] - my)
-        w = min(bbox["width"] + 2 * mx, img_w - x)
-        h = min(bbox["height"] + 2 * my, img_h - y)
-        return {"x": x, "y": y, "width": w, "height": h}
-
-    # ── main entry point ────────────────────────────────────────────────
-
     def detect(
         self,
         image_path: Path,
-        use_double_page: Optional[bool] = None,
+        full_dimensions: Optional[Dict[str, int]] = None,
+        gemini_scale: float = 1.0,
         max_regions: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Run region detection on a page image.
-
-        Parameters
-        ----------
-        image_path:
-            Path to the image to analyse.
-        use_double_page:
-            Override whether to use the double-page prompt for this specific
-            call.  When None, falls back to cfg.double_page_mode (or False
-            when auto_mode is True, since the pipeline passes the value
-            explicitly for each scan).
-
-        Returns a dict with keys:
-            status, image_path, image_dimensions, regions, total_regions,
-            reading_order, region_types_detected
-        Each region carries: id, type, bbox (pixel coords), reading_order,
-        and type-specific metadata.  Double-page / insert regions also carry
-        page_side, insert_id, insert_state.
-        """
+        """Extract all region records from a page image in one Gemini call."""
         from google.genai import types
 
-        # Resolve settings for this call
-        if use_double_page is None:
-            use_double_page = self.cfg.double_page_mode
-        effective_max = max_regions if max_regions is not None else self.cfg.max_regions
+        _ = gemini_scale  # retained for pipeline API compatibility
+        effective_max = max_regions if max_regions is not None else self.cfg.max_records
 
-        img = Image.open(image_path).convert("RGB")
-        w, h = img.size
         ext = image_path.suffix.lower()
         mime = MIME_BY_EXT.get(ext, "image/png")
         img_bytes = image_path.read_bytes()
 
-        if use_double_page:
-            prompt = DETECTION_PROMPT_DOUBLE.format(max_regions=effective_max)
+        if full_dimensions:
+            full_w = int(full_dimensions["width"])
+            full_h = int(full_dimensions["height"])
         else:
-            prompt = DETECTION_PROMPT.format(max_regions=effective_max)
+            from PIL import Image
+            with Image.open(image_path) as img:
+                full_w, full_h = img.size
+
+        prompt = EXTRACTION_PROMPT.format(max_records=effective_max)
 
         raw = ""
+        data: Dict[str, Any] = {}
         for attempt in range(self.cfg.detection_retries + 1):
             try:
                 resp = self.client.models.generate_content(
@@ -216,121 +246,206 @@ class RegionDetector:
                     ],
                     config=types.GenerateContentConfig(
                         temperature=self.cfg.detection_temperature,
-                        max_output_tokens=16384,
+                        max_output_tokens=65536,
                         thinking_config=types.ThinkingConfig(
                             thinking_level=self.cfg.detection_thinking
                         ),
                     ),
                 )
-                raw = clean_llm_json(resp.text)
-                data = json.loads(raw)
-                break  # success
-            except json.JSONDecodeError as exc:
+                raw = resp.text or ""
+                data = self._parse_response(raw)
+                if data.get("records") is not None:
+                    break
+                raise ValueError("Response missing 'records' array")
+            except (json.JSONDecodeError, ValueError) as exc:
                 if attempt < self.cfg.detection_retries:
                     log.warning(
-                        "JSON parse failed for %s (attempt %d/%d), retrying…",
+                        "Parse failed for %s (attempt %d/%d), retrying…",
                         image_path.name, attempt + 1, self.cfg.detection_retries + 1,
                     )
                     continue
-                log.error("JSON parse error for %s: %s\nRaw: %s", image_path.name, exc, raw[:400])
-                return self._error(image_path, f"JSON parse: {exc}", raw)
+                log.error("Parse error for %s: %s\nRaw: %s", image_path.name, exc, raw[:400])
+                return self._error(image_path, f"Parse: {exc}", raw)
             except Exception as exc:
-                log.error("Detection failed for %s: %s", image_path.name, exc)
+                log.error("Extraction failed for %s: %s", image_path.name, exc)
                 return self._error(image_path, str(exc), traceback.format_exc())
 
-        regions = self._validate(data.get("regions", []), w, h, use_double_page, effective_max)
+        records = self._validate_records(
+            data.get("records", []), effective_max, full_w, full_h,
+        )
+
         return {
             "status": "success",
             "image_path": str(image_path),
-            "image_dimensions": {"width": w, "height": h},
-            "regions": regions,
-            "total_regions": len(regions),
-            "reading_order": [r["id"] for r in regions],
-            "region_types_detected": sorted(set(r["type"] for r in regions)),
+            "image_dimensions": {"width": full_w, "height": full_h},
+            "records": records,
+            "total_records": len(records),
+            "reading_order": [r["id"] for r in records],
+            # Legacy key kept for callers that still look for "regions"
+            "regions": records,
+            "total_regions": len(records),
         }
 
-    # ── validation / normalisation ──────────────────────────────────────
+    # ── parsing ─────────────────────────────────────────────────────────
 
-    _VALID_PAGE_SIDES = {"left", "right", "insert"}
-    _VALID_INSERT_STATES = {"visible", "folded"}
+    @staticmethod
+    def _parse_response(raw: str) -> Dict[str, Any]:
+        """Parse JSON from model output, with markdown/XML fallbacks."""
+        cleaned = clean_llm_json(raw)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
 
-    def _validate(
+        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(1))
+
+        return {"records": RegionDetector._parse_records_from_markup(raw)}
+
+    @staticmethod
+    def _parse_records_from_markup(raw: str) -> List[Dict[str, Any]]:
+        """Best-effort extraction when the model returns markdown/XML instead of JSON."""
+        records: List[Dict[str, Any]] = []
+        xml_blocks = re.findall(r"(<record>.*?</record>)", raw, re.DOTALL | re.IGNORECASE)
+        transcriptions = re.findall(
+            r"##\s*Diplomatic transcription\s*```(?:text)?\s*(.*?)```",
+            raw, re.DOTALL | re.IGNORECASE,
+        )
+
+        for idx, xml_block in enumerate(xml_blocks):
+            fields = RegionDetector._parse_record_xml(xml_block)
+            if idx < len(transcriptions):
+                fields["diplomatic_transcription"] = transcriptions[idx].strip()
+            fields.setdefault("record_type", "Numbered dated archival regest / region record")
+            fields["xml_structure"] = xml_block
+            fields.setdefault("uncertainty_notes", [])
+            records.append(fields)
+
+        if records:
+            return records
+
+        # Last resort: one record from the full raw text
+        return [{
+            "record_number": "",
+            "date": "",
+            "marginal_reference": None,
+            "record_type": "Numbered dated archival regest / region record",
+            "end_line": "",
+            "diplomatic_transcription": raw.strip(),
+            "xml_structure": "",
+            "uncertainty_notes": [],
+        }]
+
+    @staticmethod
+    def _parse_record_xml(xml_block: str) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {
+            "record_number": "",
+            "date": "",
+            "marginal_reference": None,
+            "end_line": "",
+            "uncertainty_notes": [],
+        }
+        try:
+            root = ET.fromstring(xml_block)
+        except ET.ParseError:
+            return fields
+
+        def _text(tag: str) -> str:
+            el = root.find(tag)
+            return (el.text or "").strip() if el is not None else ""
+
+        fields["record_number"] = _text("record_number")
+        fields["date"] = _text("date")
+        marginal = _text("marginal_reference")
+        fields["marginal_reference"] = marginal or None
+        fields["end_line"] = _text("end_line")
+        body = _text("body")
+        if body:
+            fields["diplomatic_transcription"] = body
+        return fields
+
+    # ── validation ──────────────────────────────────────────────────────
+
+    def _validate_records(
         self,
-        raw_regions: List[Dict],
+        raw_records: List[Dict],
+        max_records: int,
         img_w: int,
         img_h: int,
-        double_page_context: bool,
-        max_regions: int,
-    ) -> List[Dict]:
-        out: List[Dict] = []
-        for i, r in enumerate(raw_regions[:max_regions]):
-            rtype = self._normalise_type(r.get("type", "ParagraphRegion"))
-            bbox = r.get("bbox", {})
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        total = min(len(raw_records), max_records)
+        band_h = max(img_h // max(total, 1), 1)
 
-            # normalised 0-1000 → pixel coordinates
-            nx, ny = float(bbox.get("x", 0)), float(bbox.get("y", 0))
-            nw, nh = float(bbox.get("width", 100)), float(bbox.get("height", 50))
-            px = max(0, min(int(nx * img_w / 1000), img_w - 1))
-            py = max(0, min(int(ny * img_h / 1000), img_h - 1))
-            pw = max(10, min(int(nw * img_w / 1000), img_w - px))
-            ph = max(10, min(int(nh * img_h / 1000), img_h - py))
-            pixel_bbox = self._add_margin(
-                {"x": px, "y": py, "width": pw, "height": ph},
-                img_w, img_h, self.cfg.region_margin_frac,
-            )
+        for i, rec in enumerate(raw_records[:max_records]):
+            transcription = (
+                rec.get("diplomatic_transcription")
+                or rec.get("transcription")
+                or ""
+            ).strip()
+            uncertainty = rec.get("uncertainty_notes") or []
+            if isinstance(uncertainty, str):
+                uncertainty = [uncertainty] if uncertainty else []
+
+            xml_structure = rec.get("xml_structure") or ""
+            if not xml_structure and transcription:
+                xml_structure = self._synthesise_xml(rec, transcription)
 
             entry: Dict[str, Any] = {
-                "id": "",              # set after sorting
-                "type": rtype,
-                "bbox": pixel_bbox,
-                "reading_order": int(r.get("reading_order", i + 1)),
+                "id": "",
+                "type": "RegionRecord",
+                "reading_order": i + 1,
+                "record_number": str(rec.get("record_number") or "").strip(),
+                "date": str(rec.get("date") or "").strip(),
+                "marginal_reference": rec.get("marginal_reference"),
+                "record_type": rec.get(
+                    "record_type",
+                    "Numbered dated archival regest / region record",
+                ),
+                "end_line": str(rec.get("end_line") or "").strip(),
+                "bbox": self._estimate_bbox(i, total, img_w, img_h, band_h),
+                "transcription": {
+                    "text": transcription,
+                    "xml": xml_structure,
+                    "uncertainty_notes": uncertainty,
+                },
             }
-
-            # Page / insert assignment fields (present in both prompts for inserts)
-            raw_side = str(r.get("page_side", "")).lower()
-            if raw_side in self._VALID_PAGE_SIDES:
-                entry["page_side"] = raw_side
-            elif double_page_context:
-                entry["page_side"] = "left"   # safe fallback in double-page mode
-
-            if entry.get("page_side") == "insert":
-                entry["insert_id"] = int(r.get("insert_id", 1))
-                raw_state = str(r.get("insert_state", "visible")).lower()
-                entry["insert_state"] = (
-                    raw_state if raw_state in self._VALID_INSERT_STATES else "visible"
-                )
-
-            # type-specific metadata
-            if rtype == "PageNumberRegion":
-                entry["page_number"] = r.get("page_number", None)
-            if rtype in ("ParagraphRegion", "ListRegion", "FootnoteRegion", "MarginaliaRegion"):
-                entry["line_count"] = int(r.get("line_count", 0))
-            if rtype == "TableRegion":
-                entry["rows"] = int(r.get("rows", 0))
-                entry["cols"] = int(r.get("cols", 0))
-
             out.append(entry)
 
-        # deterministic ordering
-        out.sort(key=lambda r: r["reading_order"])
-        for idx, region in enumerate(out):
-            region["id"] = f"r{idx + 1:02d}"
-            region["reading_order"] = idx + 1
+        for idx, record in enumerate(out):
+            record["id"] = f"r{idx + 1:02d}"
+            record["reading_order"] = idx + 1
 
         return out
 
     @staticmethod
-    def _normalise_type(raw: str) -> str:
-        """Map a potentially misspelled type to the canonical name."""
-        if raw in REGION_TYPES:
-            return raw
-        low = raw.lower()
-        for valid in REGION_TYPES:
-            if low in valid.lower() or valid.lower() in low:
-                return valid
-        return "ParagraphRegion"
+    def _estimate_bbox(
+        index: int, total: int, img_w: int, img_h: int, band_h: int,
+    ) -> Dict[str, int]:
+        """Approximate vertical band for PAGE XML (no bbox detection in single-pass mode)."""
+        if total <= 0:
+            return {"x": 0, "y": 0, "width": img_w, "height": img_h}
+        y = min(index * band_h, max(img_h - band_h, 0))
+        height = band_h if index < total - 1 else img_h - y
+        return {"x": 0, "y": y, "width": img_w, "height": max(height, 1)}
 
-    # ── error helper ────────────────────────────────────────────────────
+    @staticmethod
+    def _synthesise_xml(rec: Dict[str, Any], transcription: str) -> str:
+        marginal = rec.get("marginal_reference") or ""
+        marginal_tag = (
+            f"  <marginal_reference>{marginal}</marginal_reference>\n"
+            if marginal else ""
+        )
+        return (
+            "<record>\n"
+            f"  <record_number>{rec.get('record_number', '')}</record_number>\n"
+            f"  <date>{rec.get('date', '')}</date>\n"
+            f"{marginal_tag}"
+            f"  <body>\n{transcription}\n  </body>\n"
+            f"  <end_line>{rec.get('end_line', '')}</end_line>\n"
+            "</record>"
+        )
 
     @staticmethod
     def _error(path: Path, msg: str, detail: str = "") -> Dict[str, Any]:
@@ -339,6 +454,8 @@ class RegionDetector:
             "image_path": str(path),
             "error": msg,
             "detail": detail[:500],
+            "records": [],
+            "total_records": 0,
             "regions": [],
             "total_regions": 0,
         }

@@ -21,20 +21,11 @@ Each job entry is a dict with these keys:
             any prefix, any extension).
             Use "all" to process every image in the folder without filtering.
 
-  mode      "auto"        Agentic: model decides split vs. full-page per scan
-            "split"       Force split all scans down the centre
-            "full-page"   Force all scans sent to the detector unsplit
-
-  rotate    0 | 90 | 180 | 270   (default 0)
-            Pre-rotate every input image clockwise by this many degrees BEFORE
-            splitting or full-page processing.
-            Has no effect in "auto" mode (the scan analyser handles rotation).
-
   workers   int   Parallel threads (default 4)
 ─────────────────────────────────────────────────────────────────────────────
 
 Equivalent PowerShell one-liner for reference:
-    python run.py --input %tempDir% --output %outputDir% [--no-auto --split] [--rotate 90]
+    python run.py --input %tempDir% --output %outputDir%
 """
 
 import logging
@@ -62,14 +53,11 @@ JOBS: List[Dict[str, Any]] = [
         "folder":  r"NL Laubmann_34/NL Laubmann_34",
         "output":  "Laubmann_34_gemini",
         "images":  [6,13,20,22,26,29,31,42,72],
-        "mode":    "split",
-        "rotate":  270,
     },
     	{
         "folder":  r"NL Laubmann_34/NL Laubmann_34",
         "output":  "Laubmann_34_gemini",
         "images":  [4,14,15,16,17,18,21,24,28,30,34,35,36,37,38,39,40,41,44,45,46,49,50,51,52,53,54,55,56,57,58,59,60,63,67,68],
-        "mode":    "split",
     },
     
     
@@ -167,20 +155,8 @@ def _run_job(job: Dict[str, Any], job_idx: int) -> bool:
         log.error("%s  Input folder not found: %s", label, input_folder)
         return False
 
-    mode    = job.get("mode", "auto")
-    rotate  = int(job.get("rotate", 0))
     workers = int(job.get("workers", 4))
     images  = job.get("images", "all")
-
-    if rotate not in (0, 90, 180, 270):
-        log.error("%s  Invalid rotate=%s — must be 0, 90, 180, or 270.", label, rotate)
-        return False
-    if mode not in ("auto", "split", "full-page"):
-        log.error("%s  Invalid mode='%s' — must be auto, split, or full-page.", label, mode)
-        return False
-
-    auto_mode        = (mode == "auto")
-    double_page_mode = (mode == "full-page")
 
     tmp_dir = None
     try:
@@ -200,19 +176,16 @@ def _run_job(job: Dict[str, Any], job_idx: int) -> bool:
             effective_input = tmp_dir
 
         log.info(
-            "%s  mode=%s  rotate=%d°  images=%s → %s",
-            label, mode, rotate,
+            "%s  images=%s → %s",
+            label,
             "all" if images == "all" else len(images),
             output_folder,
         )
 
         cfg = PipelineConfig(
-            input_dir        = effective_input,
-            output_dir       = output_folder,
-            auto_mode        = auto_mode,
-            double_page_mode = double_page_mode,
-            force_rotation   = rotate,
-            workers          = workers,
+            input_dir  = effective_input,
+            output_dir = output_folder,
+            workers    = workers,
         )
 
         pipeline = Pipeline(cfg)

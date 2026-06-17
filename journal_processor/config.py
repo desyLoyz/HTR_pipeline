@@ -78,36 +78,19 @@ ENTITY_LABELS: Dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Region taxonomy
+# Archival register record taxonomy (single-pass extraction)
 # ---------------------------------------------------------------------------
-REGION_TYPES: List[str] = [
-    "ParagraphRegion",
-    "ListRegion",
-    "TableRegion",
-    "ObjectRegion",
-    "PageNumberRegion",
-    "MarginaliaRegion",
-    "FootnoteRegion",
-    "ImageRegion",
-]
+RECORD_TYPE = "RegionRecord"
 
-# Region types that contain transcribable running text
-TEXT_REGION_TYPES = {"ParagraphRegion", "ListRegion", "FootnoteRegion"}
+MAX_RECORDS_PER_PAGE = 8
 
-# Region types included in the ShareGPT training-data export
-SHAREGPT_REGION_TYPES = {"ParagraphRegion", "ListRegion", "TableRegion", "FootnoteRegion"}
-
-# Marginalia is intentionally excluded from Markdown output (kept in all others)
-MD_EXCLUDED_TYPES = {"MarginaliaRegion"}
-
-MAX_REGIONS_PER_PAGE = 5
-MAX_REGIONS_DOUBLE_PAGE = 10
+# Default long-edge cap for images sent to Gemini (full-res kept for crops).
+GEMINI_MAX_LONG_EDGE = 3072
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 MODEL_ID = "gemini-3-flash-preview"
-ANALYZER_MODEL_ID = "gemini-3-flash-preview"   # same as main model — lite was too weak for rotation detection
 
 # ---------------------------------------------------------------------------
 # Pipeline defaults
@@ -117,22 +100,8 @@ ANALYZER_MODEL_ID = "gemini-3-flash-preview"   # same as main model — lite was
 class PipelineConfig:
     """All tuneable knobs live here.
 
-    Processing mode
-    ---------------
-    auto_mode (default True)
-        Before each scan a lightweight Gemini call analyses the image and
-        decides whether to split it or send it unsplit to the detector.
-        Different scans in the same batch may be handled differently.
-
-    double_page_mode
-        Only used when auto_mode=False.  When True, ALL scans are sent to the
-        detector without splitting (full double-page prompt).  When False, ALL
-        scans are split down the centre first.
-
-    Insert handling
-    ---------------
-    The detector tags regions from loose insert sheets with page_side="insert"
-    and insert_state="visible" | "folded".  Folded inserts are not transcribed.
+    Each input scan is treated as a single page.  Full-resolution working
+    copies are kept for crops and exports; a downscaled JPEG is sent to Gemini.
     """
 
     # I/O paths
@@ -141,37 +110,21 @@ class PipelineConfig:
 
     # Models
     model_id: str = MODEL_ID
-    analyzer_model_id: str = ANALYZER_MODEL_ID  # fast/cheap model for scan routing
 
-    # Processing mode
-    auto_mode: bool = True              # agentic: model decides split vs full per scan
-    double_page_mode: bool = False      # fallback when auto_mode=False
-
-    # Splitting (only used when a scan is determined to need splitting)
-    split_overlap_px: int = 10          # slight overlap when cropping centre
+    # Gemini image sizing (0 = use GEMINI_MAX_LONG_EDGE default)
+    gemini_max_long_edge: int = GEMINI_MAX_LONG_EDGE
 
     # Pre-processing
     deskew: bool = False                # optional deskew step
     enhance_contrast: bool = False      # optional CLAHE contrast boost
 
-    # Region detection
-    max_regions: int = MAX_REGIONS_PER_PAGE
-    region_margin_frac: float = 0.005   # margin added around detected boxes
+    # Single-pass extraction (detection + diplomatic transcription)
+    max_records: int = MAX_RECORDS_PER_PAGE
     # Gemini 3 docs: keep temperature at 1.0 (default); values < 1.0 may cause
     # looping or degraded performance on complex tasks.
     detection_temperature: float = 1.0
-    detection_thinking: str = "high"
-    detection_retries: int = 2          # retry on bad JSON from Gemini
-
-    # Transcription (Gemini — always used for tables/images/objects)
-    transcription_temperature: float = 0.0
-    transcription_thinking: str = "low"
-
-    # Transcription (GLM-OCR — used for text regions when enabled)
-    use_glm_ocr: bool = False
-    glm_ocr_base_model: str = "zai-org/GLM-OCR"
-    glm_ocr_lora_path: str = ""              # path to LoRA adapter dir
-    glm_ocr_max_new_tokens: int = 2048
+    detection_thinking: str = "low"
+    detection_retries: int = 3          # retry on bad JSON from Gemini
 
     # Output formats (all enabled by default)
     output_md: bool = True
@@ -179,28 +132,21 @@ class PipelineConfig:
     output_sharegpt: bool = True
 
     # ShareGPT
-    sharegpt_system_prompt: str = "Transcribe the german text in this image region."
+    sharegpt_system_prompt: str = (
+        "Detect and transcribe numbered archival register records from this "
+        "German Kurrent manuscript page using diplomatic transcription."
+    )
 
     # NER (Stage 7 – run separately in Colab via Run_NER_Stage.py)
     ner_model_id: str = MODEL_ID
     ner_thinking_level: str = "low"
     ner_retries: int = 2
 
-    # Pre-rotation (applied before splitting or full-page processing)
-    force_rotation: int = 0             # 0, 90, 180, or 270 degrees clockwise
-
     # Concurrency
     workers: int = 4                    # parallel page processing threads
 
-    def __post_init__(self) -> None:
-        # In double-page / auto mode we typically need more regions.
-        # Raise the default only when the user hasn't overridden it.
-        if not self.auto_mode and self.double_page_mode:
-            if self.max_regions == MAX_REGIONS_PER_PAGE:
-                self.max_regions = MAX_REGIONS_DOUBLE_PAGE
-
     def ensure_dirs(self) -> None:
         """Create output sub-directories."""
-        for sub in ("pages", "regions", "md", "pagexml", "pagexml_ner",
+        for sub in ("pages", "pages_gemini", "records", "md", "pagexml", "pagexml_ner",
                     "sharegpt", "sharegpt/images"):
             (self.output_dir / sub).mkdir(parents=True, exist_ok=True)

@@ -1,35 +1,31 @@
-# Journal Processor
+# HTR Pipeline for archival registers (for court files)
 
-End-to-end pipeline for processing ~3 000 double-paged digitised journal scans
-of a German ornithologist's field journal.
+Pipeline for transcription of **handwritten, scanned historical German archival register pages** (court files), from the **13th century onward**.
 
 ## Pipeline stages
 
 ```
-1. Split     double-page scan → left page + right page
+1. Prepare     input scan → normalized full-resolution page PNG
 2. Preprocess  optional deskew / contrast enhancement
-3. Detect    region detection via Gemini 3 Flash Preview
-4. Transcribe  per-region text recognition via Gemini 3 Flash Preview
-5. Output    Markdown · PAGE XML · ShareGPT JSONL
+3. Downscale   optional API-friendly copy for Gemini
+4. Extract     region detection + diplomatic transcription (single call per page)
+5. Output      records JSON · (optional) Markdown · PAGE XML · ShareGPT JSONL
 ```
 
 ## Output structure
 
 ```
 output/
-├── pages/            # individual page images (left/right)
-├── regions/          # per-page region crops + detection JSON
-│   ├── scan_001_L/
-│   │   ├── r01_ParagraphRegion.png
-│   │   └── r02_PageNumberRegion.png
-│   └── scan_001_L.json
-├── md/               # Markdown page reconstructions
-├── pagexml/          # PAGE XML with layout + transcription
-├── sharegpt/         # training_data.jsonl
+├── pages/            # normalized full-resolution page PNGs
+├── pages_gemini/     # downscaled JPEGs used for the API (optional)
+├── records/          # per-page structured extraction JSON
+├── md/               # (optional) Markdown page reconstructions
+├── pagexml/          # (optional) PAGE XML with layout + transcription
+├── sharegpt/         # (optional) training_data.jsonl (+ images/)
 └── summary.json
 ```
 
-## Region types
+## Record / region types
 
 | Type | Metadata | Transcription |
 |------|----------|---------------|
@@ -57,7 +53,7 @@ python run.py -i /path/to/scans -o /path/to/output
 # Options
 python run.py -i scans/ -o out/ \
     --workers 8 \
-    --max-regions 5 \
+    --max-records 8 \
     --deskew \
     --enhance-contrast \
     -v
@@ -65,10 +61,7 @@ python run.py -i scans/ -o out/ \
 
 ## Notes
 
-- The detection prompt instructs Gemini to keep whole journal entries
-  (date + city) in a single region where possible.
-- Maximum 5 regions per page by default to avoid over-segmentation.
-- PageNumberRegion extraction happens during detection, saving one API call.
-- ShareGPT output only includes ParagraphRegion, ListRegion, TableRegion,
-  and FootnoteRegion.
-- Region crops are saved alongside detection JSON for debugging / review.
+- Each input image is treated as **one page**.
+- Region detection and diplomatic transcription are performed in a **single Gemini call per page**.
+- `PageNumberRegion` extraction happens during detection, saving one extra call/step.
+- ShareGPT output only includes `ParagraphRegion`, `ListRegion`, `TableRegion`, and `FootnoteRegion`.

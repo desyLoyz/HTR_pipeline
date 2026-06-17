@@ -3,3 +3,8 @@ credentials.json
 token.json
 __pycache__/
 *.pyc
+
+# Local run outputs / datasets (do not commit)
+out*/
+scans*/
+output/

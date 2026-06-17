@@ -1,5 +1,9 @@
 """Per-region transcription using Gemini 3 Flash Preview.
 
+NOTE: Unused by the current archival-register pipeline. This module was only
+used in the ornithologist's journal pipeline (bbox detection + per-region
+transcription). Kept for reference.
+
 Each region type gets a specialised prompt:
   • Text regions  → exact line-by-line transcription, underline/superscript markup
   • Tables        → Markdown table preserving rows/cols

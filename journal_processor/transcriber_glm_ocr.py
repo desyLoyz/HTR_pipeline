@@ -1,5 +1,9 @@
 """Per-region transcription using a fine-tuned GLM-OCR model (local GPU).
 
+NOTE: Unused by the current archival-register pipeline. This module was only
+used in the ornithologist's journal pipeline (bbox detection + per-region
+transcription). Kept for reference.
+
 Only *text* regions are handled locally:
     ParagraphRegion, ListRegion, FootnoteRegion, MarginaliaRegion
 
